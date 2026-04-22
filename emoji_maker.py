@@ -1,0 +1,1548 @@
+#!/usr/bin/env python3
+"""
+Convert an input image into an emoji mosaic image.
+
+Example:
+    python emoji_maker.py --input photo.png --output result.png --columns 120
+"""
+
+from __future__ import annotations
+
+import argparse
+import tempfile
+import json
+import math
+import os
+import re
+import shutil
+import time
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+from typing import List, Sequence, Tuple
+
+import numpy as np
+from PIL import Image, ImageColor, ImageDraw, ImageFont
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ModuleNotFoundError:
+    tk = None
+    filedialog = None
+    messagebox = None
+    ttk = None
+
+
+DEFAULT_PALETTE = [
+    "⬛", "⬜", "🟥", "🟧", "🟨", "🟩", "🟦", "🟪", "🟫",
+    "❤️", "🧡", "💛", "💚", "💙", "💜",
+    "🍎", "🍊", "🍋", "🥝", "🫐", "🍇", "🍓",
+    "🌸", "🌻", "🌲", "🌊", "☁️", "🌙", "⭐",
+    "🔥", "⚡", "❄️", "🪨", "🥥", "🧠", "🐸",
+]
+
+COMMON_EMOJI_FONTS = [
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/google-noto-color-emoji-fonts/Noto-COLRv1.ttf",
+    "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf",
+    "/usr/share/fonts/TTF/NotoColorEmoji.ttf",
+    "/usr/share/fonts/emoji/NotoColorEmoji.ttf",
+    "/usr/local/share/fonts/NotoColorEmoji.ttf",
+    str(Path.home() / ".local/share/fonts/NotoColorEmoji.ttf"),
+    str(Path.home() / ".fonts/NotoColorEmoji.ttf"),
+    "/System/Library/Fonts/Apple Color Emoji.ttc",
+    "/System/Library/Fonts/Apple Color Emoji.ttf",
+    "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
+    "/usr/share/fonts/truetype/ancient-scripts/Symbola.ttf",
+    "C:/Windows/Fonts/seguiemj.ttf",
+]
+
+COMMON_EMOJI_FONT_FAMILIES = [
+    "Noto Color Emoji",
+    "Apple Color Emoji",
+    "Segoe UI Emoji",
+    "Twitter Color Emoji",
+    "EmojiOne Color",
+    "Symbola",
+]
+
+PALETTE_SPLIT_RE = re.compile(r"[\s,]+")
+TWEMOJI_BASE_URL = "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72"
+TWEMOJI_CACHE_DIR = Path(".emoji_cache") / "twemoji" / "72x72"
+RUN_HISTORY_PATH = Path(".emoji_cache") / "render_history.json"
+MAX_HISTORY_ENTRIES = 200
+
+
+@dataclass(frozen=True)
+class PaletteEntry:
+    emoji: str
+    mean_rgb: np.ndarray
+    brightness: float
+    saturation: float
+    alpha_coverage: float
+
+
+@dataclass(frozen=True)
+class EmojiRenderSource:
+    kind: str
+    font: ImageFont.FreeTypeFont | None = None
+
+
+@dataclass(frozen=True)
+class RenderEstimate:
+    seconds: float
+    sample_count: int
+    confidence: str
+
+
+@dataclass(frozen=True)
+class RenderResult:
+    output_path: Path
+    duration_seconds: float
+    total_cells: int
+    filled_cells: int
+    columns: int
+    rows: int
+    palette_size: int
+    emoji_size: int
+    emoji_source: str
+
+
+@dataclass(frozen=True)
+class VideoResult:
+    output_path: Path
+    duration_seconds: float
+    frame_count: int
+    fps: int
+    start_columns: int
+    max_columns: int
+    step_columns: int
+    canvas_width: int
+    canvas_height: int
+
+
+def fail(message: str) -> None:
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds:.2f} s"
+    if seconds < 10:
+        return f"{seconds:.1f} s"
+    if seconds < 60:
+        return f"{seconds:.0f} s"
+    minutes = int(seconds // 60)
+    remaining_seconds = int(round(seconds - (minutes * 60)))
+    return f"{minutes} min {remaining_seconds} s"
+
+
+def has_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+def ensure_history_dir() -> None:
+    RUN_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def load_render_history() -> List[dict]:
+    if not RUN_HISTORY_PATH.exists():
+        return []
+    try:
+        data = json.loads(RUN_HISTORY_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def save_render_history(history: Sequence[dict]) -> None:
+    ensure_history_dir()
+    trimmed_history = list(history)[-MAX_HISTORY_ENTRIES:]
+    RUN_HISTORY_PATH.write_text(
+        json.dumps(trimmed_history, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def build_render_profile(
+    *,
+    columns: int,
+    rows: int,
+    palette_size: int,
+    emoji_size: int,
+    emoji_source: str,
+) -> dict[str, int | str]:
+    return {
+        "columns": columns,
+        "rows": rows,
+        "total_cells": columns * rows,
+        "palette_size": palette_size,
+        "emoji_size": emoji_size,
+        "emoji_source": emoji_source,
+    }
+
+
+def estimate_duration(profile: dict[str, int | str]) -> RenderEstimate:
+    history = load_render_history()
+    if not history:
+        total_cells = int(profile["total_cells"])
+        emoji_source = str(profile["emoji_source"])
+        baseline_fixed = 0.35 if emoji_source == "font" else 0.8
+        baseline_per_cell = 0.0002 if emoji_source == "font" else 0.00045
+        return RenderEstimate(
+            seconds=baseline_fixed + (total_cells * baseline_per_cell),
+            sample_count=0,
+            confidence="faible",
+        )
+
+    scored_history: List[Tuple[float, dict]] = []
+    for item in history:
+        if item.get("duration_seconds", 0) <= 0 or item.get("total_cells", 0) <= 0:
+            continue
+        distance = 0.0
+        if item.get("emoji_source") != profile["emoji_source"]:
+            distance += 4.0
+        distance += abs(int(item.get("total_cells", 0)) - int(profile["total_cells"])) / max(1, int(profile["total_cells"]))
+        distance += abs(int(item.get("palette_size", 0)) - int(profile["palette_size"])) / max(1, int(profile["palette_size"]))
+        distance += abs(int(item.get("emoji_size", 0)) - int(profile["emoji_size"])) / max(1, int(profile["emoji_size"]))
+        scored_history.append((distance, item))
+
+    if not scored_history:
+        total_cells = int(profile["total_cells"])
+        return RenderEstimate(seconds=0.5 + (total_cells * 0.0003), sample_count=0, confidence="faible")
+
+    scored_history.sort(key=lambda item: item[0])
+    nearest = scored_history[: min(12, len(scored_history))]
+
+    weighted_seconds_per_cell = 0.0
+    total_weight = 0.0
+    for distance, item in nearest:
+        cells = max(1, int(item["total_cells"]))
+        seconds_per_cell = float(item["duration_seconds"]) / cells
+        weight = 1.0 / (0.25 + distance)
+        weighted_seconds_per_cell += seconds_per_cell * weight
+        total_weight += weight
+
+    avg_seconds_per_cell = weighted_seconds_per_cell / max(total_weight, 1e-6)
+    fixed_overhead = 0.15 if str(profile["emoji_source"]) == "font" else 0.35
+    estimated_seconds = fixed_overhead + (int(profile["total_cells"]) * avg_seconds_per_cell)
+
+    sample_count = len(nearest)
+    if sample_count >= 8:
+        confidence = "élevée"
+    elif sample_count >= 4:
+        confidence = "moyenne"
+    else:
+        confidence = "faible"
+
+    return RenderEstimate(
+        seconds=max(0.1, estimated_seconds),
+        sample_count=sample_count,
+        confidence=confidence,
+    )
+
+
+def append_render_history(result: RenderResult) -> None:
+    history = load_render_history()
+    history.append(
+        {
+            "timestamp": time.time(),
+            "duration_seconds": result.duration_seconds,
+            "total_cells": result.total_cells,
+            "filled_cells": result.filled_cells,
+            "columns": result.columns,
+            "rows": result.rows,
+            "palette_size": result.palette_size,
+            "emoji_size": result.emoji_size,
+            "emoji_source": result.emoji_source,
+        }
+    )
+    save_render_history(history)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Convert an image into an emoji mosaic image."
+    )
+    parser.add_argument("--input", required=True, help="Path to the input image.")
+    parser.add_argument("--output", required=True, help="Path to the output PNG image.")
+    parser.add_argument(
+        "--columns",
+        type=int,
+        help="Number of emoji cells horizontally. Preserves aspect ratio unless --stretch is used.",
+    )
+    parser.add_argument(
+        "--rows",
+        type=int,
+        help="Number of emoji cells vertically. Preserves aspect ratio unless --stretch is used.",
+    )
+    parser.add_argument(
+        "--emoji-size",
+        type=int,
+        default=20,
+        help="Rendered emoji cell size in output pixels. Default: 20.",
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help="Multiplier for automatic grid density when --columns/--rows are omitted. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--palette",
+        help=(
+            "Custom emoji palette. Either a comma/space separated string like "
+            "'😀,😎,🔥' or a text file path containing emojis."
+        ),
+    )
+    parser.add_argument(
+        "--background",
+        default="transparent",
+        help="Background color for empty areas, e.g. transparent, white, black, #112233. Default: transparent.",
+    )
+    parser.add_argument(
+        "--font",
+        help="Path to an emoji-capable font file. Recommended when auto-detection does not find one.",
+    )
+    parser.add_argument(
+        "--emoji-source",
+        choices=("auto", "font", "twemoji"),
+        default="auto",
+        help="Emoji rendering backend. 'auto' prefers a local font and falls back to Twemoji PNG assets. Default: auto.",
+    )
+    parser.add_argument(
+        "--stretch",
+        action="store_true",
+        help="Allow non-proportional resizing when both --columns and --rows are provided.",
+    )
+    parser.add_argument(
+        "--alpha-threshold",
+        type=float,
+        default=0.05,
+        help="Cells with alpha coverage at or below this value are left empty. Range: 0.0 to 1.0.",
+    )
+    parser.add_argument("--video-output", help="Optional animated output path (.gif or .mp4).")
+    parser.add_argument(
+        "--video-fps",
+        type=int,
+        default=5,
+        help="FPS for animated output. Default: 5.",
+    )
+    parser.add_argument(
+        "--video-start-columns",
+        type=int,
+        default=1,
+        help="Starting number of columns for the animation. Default: 1.",
+    )
+    parser.add_argument(
+        "--video-max-columns",
+        type=int,
+        help="Ending number of columns for the animation. Defaults to --columns if provided, otherwise 500.",
+    )
+    parser.add_argument(
+        "--video-step-columns",
+        type=int,
+        default=2,
+        help="Column increment between frames for the animation. Default: 2.",
+    )
+    return parser.parse_args()
+
+
+def load_image(path: str) -> Image.Image:
+    image_path = Path(path)
+    if not image_path.is_file():
+        fail(f"Input image does not exist: {image_path}")
+    try:
+        return Image.open(image_path).convert("RGBA")
+    except OSError as exc:
+        fail(f"Could not open input image '{image_path}': {exc}")
+        raise AssertionError("unreachable")
+
+
+def parse_background(value: str) -> Tuple[int, int, int, int]:
+    if value.lower() == "transparent":
+        return (0, 0, 0, 0)
+    try:
+        rgb = ImageColor.getrgb(value)
+    except ValueError as exc:
+        fail(f"Invalid background color '{value}': {exc}")
+        raise AssertionError("unreachable")
+    return (rgb[0], rgb[1], rgb[2], 255)
+
+
+def parse_palette(palette_arg: str | None) -> List[str]:
+    if palette_arg is None:
+        palette = list(DEFAULT_PALETTE)
+    else:
+        candidate_path = Path(palette_arg)
+        if candidate_path.is_file():
+            content = candidate_path.read_text(encoding="utf-8").strip()
+            tokens = [
+                token.strip()
+                for token in PALETTE_SPLIT_RE.split(content)
+                if token.strip()
+            ]
+            palette = tokens
+        else:
+            tokens = [
+                token.strip()
+                for token in PALETTE_SPLIT_RE.split(palette_arg)
+                if token.strip()
+            ]
+            palette = tokens
+
+    unique_palette = []
+    seen = set()
+    for emoji in palette:
+        if emoji not in seen:
+            unique_palette.append(emoji)
+            seen.add(emoji)
+
+    if not unique_palette:
+        fail("Palette is empty. Provide at least one emoji.")
+    return unique_palette
+
+
+def fontconfig_match(family: str) -> str | None:
+    if shutil.which("fc-match") is None:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["fc-match", "--format=%{family}\n%{file}\n", family],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+
+    matched_family = lines[0].lower()
+    matched_path = lines[1]
+    matched_name = Path(matched_path).name.lower()
+    if (
+        "emoji" not in matched_name
+        and "symbola" not in matched_name
+        and "emoji" not in matched_family
+        and "symbola" not in matched_family
+    ):
+        return None
+
+    matched_file = Path(matched_path)
+    if not matched_file.exists():
+        return None
+    return str(matched_file)
+
+
+def build_font_search_candidates(font_path: str | None) -> List[str]:
+    if font_path:
+        return [font_path]
+
+    search_candidates: List[str] = []
+    seen = set()
+
+    for candidate in COMMON_EMOJI_FONTS:
+        if candidate not in seen:
+            search_candidates.append(candidate)
+            seen.add(candidate)
+
+    for family in COMMON_EMOJI_FONT_FAMILIES:
+        matched_path = fontconfig_match(family)
+        if matched_path and matched_path not in seen:
+            search_candidates.append(matched_path)
+            seen.add(matched_path)
+        if family not in seen:
+            search_candidates.append(family)
+            seen.add(family)
+
+    return search_candidates
+
+
+def probe_font_emoji(font: ImageFont.ImageFont) -> Tuple[bool, bool]:
+    probe = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(probe)
+    test_emoji = "😀"
+    try:
+        draw.text((0, 0), test_emoji, font=font, embedded_color=True)
+    except TypeError:
+        draw.text((0, 0), test_emoji, font=font, fill=(255, 255, 255, 255))
+    if probe.getbbox() is None:
+        return False, False
+
+    colors = probe.getcolors(maxcolors=4096) or []
+    has_non_gray = any(
+        alpha > 0 and not (red == green == blue)
+        for _, (red, green, blue, alpha) in colors
+    )
+    return True, has_non_gray
+
+
+def find_emoji_font(font_path: str | None, size: int) -> ImageFont.FreeTypeFont:
+    search_paths: Sequence[str] = build_font_search_candidates(font_path)
+    last_error: Exception | None = None
+    attempted: List[str] = []
+
+    for candidate in search_paths:
+        if not candidate:
+            continue
+        try:
+            if Path(candidate).exists() or os.path.sep not in candidate:
+                attempted.append(candidate)
+                font = ImageFont.truetype(candidate, size=size)
+                renders, _has_color = probe_font_emoji(font)
+                if renders:
+                    return font
+        except OSError as exc:
+            last_error = exc
+            attempted.append(candidate)
+
+    help_text = (
+        "Could not load an emoji-capable font. "
+        "Pass --font /path/to/emoji_font.ttf (for example NotoColorEmoji.ttf, "
+        "Apple Color Emoji.ttc, or seguiemj.ttf)."
+    )
+    if not font_path:
+        help_text += (
+            " On Linux, install an emoji font such as the Noto Color Emoji package "
+            "and retry."
+        )
+        if attempted:
+            help_text += f" Checked: {', '.join(attempted[:8])}"
+    if font_path:
+        fail(f"{help_text} Failed font: {font_path}")
+    if last_error:
+        fail(f"{help_text} Last error: {last_error}")
+    fail(help_text)
+    raise AssertionError("unreachable")
+
+
+def try_find_emoji_font(font_path: str | None, size: int) -> ImageFont.FreeTypeFont | None:
+    try:
+        return find_emoji_font(font_path, size)
+    except SystemExit:
+        return None
+
+
+def emoji_codepoint_candidates(emoji: str) -> List[str]:
+    codepoints = [ord(char) for char in emoji]
+    exact = "-".join(f"{codepoint:x}" for codepoint in codepoints)
+    without_fe0f = "-".join(f"{codepoint:x}" for codepoint in codepoints if codepoint != 0xFE0F)
+    candidates = []
+    for candidate in (exact, without_fe0f):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def fetch_twemoji_tile(emoji: str, tile_size: int) -> Image.Image:
+    TWEMOJI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    errors: List[str] = []
+
+    for codepoint_name in emoji_codepoint_candidates(emoji):
+        cache_path = TWEMOJI_CACHE_DIR / f"{codepoint_name}.png"
+        if cache_path.exists():
+            try:
+                tile = Image.open(cache_path).convert("RGBA")
+                return tile.resize((tile_size, tile_size), Image.Resampling.LANCZOS)
+            except OSError as exc:
+                errors.append(f"{cache_path}: {exc}")
+
+        url = f"{TWEMOJI_BASE_URL}/{codepoint_name}.png"
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "emoji_maker/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = response.read()
+        except urllib.error.URLError as exc:
+            errors.append(f"{url}: {exc}")
+            continue
+
+        try:
+            cache_path.write_bytes(data)
+            tile = Image.open(BytesIO(data)).convert("RGBA")
+            return tile.resize((tile_size, tile_size), Image.Resampling.LANCZOS)
+        except OSError as exc:
+            errors.append(f"{url}: {exc}")
+
+    fail(
+        f"Could not fetch emoji asset for {emoji!r} from Twemoji. "
+        f"Tried: {', '.join(emoji_codepoint_candidates(emoji))}. "
+        f"Last errors: {'; '.join(errors[-2:]) if errors else 'none'}"
+    )
+    raise AssertionError("unreachable")
+
+
+def resolve_render_source(
+    font_path: str | None,
+    emoji_size: int,
+    emoji_source: str,
+) -> EmojiRenderSource:
+    if emoji_source in ("auto", "font"):
+        font = try_find_emoji_font(font_path, size=max(12, int(emoji_size * 0.9)))
+        if font is not None:
+            _renders, has_color = probe_font_emoji(font)
+            if emoji_source == "font" or has_color:
+                return EmojiRenderSource(kind="font", font=font)
+        if emoji_source == "font":
+            find_emoji_font(font_path, size=max(12, int(emoji_size * 0.9)))
+    return EmojiRenderSource(kind="twemoji")
+
+
+def compute_grid_size(
+    width: int,
+    height: int,
+    columns: int | None,
+    rows: int | None,
+    scale: float,
+    stretch: bool,
+) -> Tuple[int, int]:
+    if scale <= 0:
+        fail("--scale must be greater than 0.")
+
+    aspect_ratio = width / height
+
+    if columns is not None and columns <= 0:
+        fail("--columns must be greater than 0.")
+    if rows is not None and rows <= 0:
+        fail("--rows must be greater than 0.")
+
+    if columns is not None and rows is not None:
+        if stretch:
+            return columns, rows
+        fail("Using both --columns and --rows changes the aspect ratio. Add --stretch to allow that.")
+
+    if columns is not None:
+        computed_rows = max(1, int(round(columns / aspect_ratio)))
+        return columns, computed_rows
+
+    if rows is not None:
+        computed_columns = max(1, int(round(rows * aspect_ratio)))
+        return computed_columns, rows
+
+    base_columns = max(1, int(round((width / 8.0) * scale)))
+    computed_rows = max(1, int(round(base_columns / aspect_ratio)))
+    return base_columns, computed_rows
+
+
+def resize_for_grid(image: Image.Image, columns: int, rows: int) -> Image.Image:
+    return image.resize((columns, rows), Image.Resampling.BOX)
+
+
+def build_frame_sequence(start_columns: int, max_columns: int, step_columns: int) -> List[int]:
+    if start_columns <= 0:
+        fail("--video-start-columns must be greater than 0.")
+    if max_columns < start_columns:
+        fail("--video-max-columns must be greater than or equal to --video-start-columns.")
+    if step_columns <= 0:
+        fail("--video-step-columns must be greater than 0.")
+
+    sequence = list(range(start_columns, max_columns + 1, step_columns))
+    if sequence[-1] != max_columns:
+        sequence.append(max_columns)
+    return sequence
+
+
+def pad_frame_to_size(frame: Image.Image, width: int, height: int, background: Tuple[int, int, int, int]) -> Image.Image:
+    if frame.width == width and frame.height == height:
+        return frame
+    canvas = Image.new("RGBA", (width, height), background)
+    x = (width - frame.width) // 2
+    y = (height - frame.height) // 2
+    canvas.alpha_composite(frame, (x, y))
+    return canvas
+
+
+def render_canvas_for_grid(
+    image: Image.Image,
+    background: Tuple[int, int, int, int],
+    render_source: EmojiRenderSource,
+    palette_entries: Sequence[PaletteEntry],
+    emoji_size: int,
+    alpha_threshold: float,
+    columns: int,
+    rows: int,
+) -> tuple[Image.Image, int]:
+    sampled_image = resize_for_grid(image, columns, rows)
+    emoji_grid = build_emoji_grid(sampled_image, palette_entries, alpha_threshold)
+    canvas = render_emoji_canvas(emoji_grid, emoji_size, render_source, background)
+    filled_cells = sum(1 for row in emoji_grid for emoji in row if emoji is not None)
+    return canvas, filled_cells
+
+
+def render_video_with_args(
+    args: argparse.Namespace,
+    video_output: str,
+    video_fps: int,
+    video_start_columns: int,
+    video_max_columns: int,
+    video_step_columns: int,
+) -> VideoResult:
+    if video_fps <= 0:
+        fail("--video-fps must be greater than 0.")
+
+    image, background, palette, _columns, _rows, render_source = prepare_render(args)
+    palette_entries = build_palette_entries(palette, args.emoji_size, render_source)
+    frame_columns = build_frame_sequence(video_start_columns, video_max_columns, video_step_columns)
+
+    frame_specs: List[tuple[int, int]] = []
+    max_width = 0
+    max_height = 0
+    for columns in frame_columns:
+        computed_columns, computed_rows = compute_grid_size(
+            width=image.width,
+            height=image.height,
+            columns=columns,
+            rows=None,
+            scale=args.scale,
+            stretch=False,
+        )
+        frame_specs.append((computed_columns, computed_rows))
+        max_width = max(max_width, computed_columns * args.emoji_size)
+        max_height = max(max_height, computed_rows * args.emoji_size)
+
+    frames: List[Image.Image] = []
+    started_at = time.perf_counter()
+    for columns, rows in frame_specs:
+        frame, _filled_cells = render_canvas_for_grid(
+            image=image,
+            background=background,
+            render_source=render_source,
+            palette_entries=palette_entries,
+            emoji_size=args.emoji_size,
+            alpha_threshold=args.alpha_threshold,
+            columns=columns,
+            rows=rows,
+        )
+        frames.append(pad_frame_to_size(frame, max_width, max_height, background))
+
+    output_path = Path(video_output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    suffix = output_path.suffix.lower()
+    if suffix == ".mp4":
+        if not has_ffmpeg():
+            fail("ffmpeg is required to export MP4. Use a .gif output or install ffmpeg.")
+        with tempfile.TemporaryDirectory(prefix="emoji_video_") as temp_dir:
+            temp_path = Path(temp_dir)
+            for index, frame in enumerate(frames):
+                frame.convert("RGBA").save(temp_path / f"frame_{index:04d}.png", format="PNG")
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-framerate",
+                str(video_fps),
+                "-i",
+                str(temp_path / "frame_%04d.png"),
+                "-pix_fmt",
+                "yuv420p",
+                str(output_path),
+            ]
+            result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            if result.returncode != 0:
+                fail(f"ffmpeg failed to create the MP4: {result.stderr.strip()}")
+    else:
+        duration_ms = max(20, int(round(1000 / video_fps)))
+        first_frame, *other_frames = [frame.convert("RGBA") for frame in frames]
+        first_frame.save(
+            output_path,
+            save_all=True,
+            append_images=other_frames,
+            duration=duration_ms,
+            loop=0,
+            disposal=2,
+            format="GIF",
+        )
+
+    return VideoResult(
+        output_path=output_path,
+        duration_seconds=time.perf_counter() - started_at,
+        frame_count=len(frames),
+        fps=video_fps,
+        start_columns=video_start_columns,
+        max_columns=video_max_columns,
+        step_columns=video_step_columns,
+        canvas_width=max_width,
+        canvas_height=max_height,
+    )
+
+
+def rgb_to_brightness(rgb: np.ndarray) -> float:
+    return float(0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2])
+
+
+def rgb_to_saturation(rgb: np.ndarray) -> float:
+    rgb_norm = rgb.astype(np.float32) / 255.0
+    max_value = float(np.max(rgb_norm))
+    min_value = float(np.min(rgb_norm))
+    if max_value == 0:
+        return 0.0
+    return (max_value - min_value) / max_value
+
+
+def compute_cell_average(cell_rgba: np.ndarray) -> Tuple[np.ndarray, float, float, float]:
+    alpha = cell_rgba[..., 3].astype(np.float32) / 255.0
+    coverage = float(np.mean(alpha > 0.01))
+    alpha_sum = float(np.sum(alpha))
+
+    if alpha_sum <= 1e-6:
+        return np.zeros(3, dtype=np.float32), 0.0, 0.0, 0.0
+
+    rgb = cell_rgba[..., :3].astype(np.float32)
+    weighted_rgb = (rgb * alpha[..., None]).sum(axis=(0, 1)) / alpha_sum
+    brightness = rgb_to_brightness(weighted_rgb)
+    saturation = rgb_to_saturation(weighted_rgb)
+    mean_alpha = float(np.mean(alpha))
+    return weighted_rgb, brightness, saturation, max(coverage, mean_alpha)
+
+
+def get_text_bbox(draw: ImageDraw.ImageDraw, emoji: str, font: ImageFont.ImageFont) -> Tuple[int, int, int, int]:
+    try:
+        return draw.textbbox((0, 0), emoji, font=font, embedded_color=True)
+    except TypeError:
+        return draw.textbbox((0, 0), emoji, font=font)
+
+
+def draw_emoji(
+    image: Image.Image,
+    position: Tuple[float, float],
+    emoji: str,
+    font: ImageFont.ImageFont,
+) -> None:
+    draw = ImageDraw.Draw(image)
+    try:
+        draw.text(position, emoji, font=font, embedded_color=True)
+    except TypeError:
+        draw.text(position, emoji, font=font, fill=(255, 255, 255, 255))
+
+
+def render_single_emoji_tile(
+    emoji: str,
+    tile_size: int,
+    render_source: EmojiRenderSource,
+) -> Image.Image:
+    if render_source.kind == "twemoji":
+        return fetch_twemoji_tile(emoji, tile_size)
+
+    if render_source.font is None:
+        fail("Internal error: font render source is missing a font.")
+    tile = Image.new("RGBA", (tile_size, tile_size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(tile)
+    bbox = get_text_bbox(draw, emoji, render_source.font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    x = (tile_size - text_width) / 2.0 - bbox[0]
+    y = (tile_size - text_height) / 2.0 - bbox[1]
+    draw_emoji(tile, (x, y), emoji, render_source.font)
+    return tile
+
+
+def build_palette_entries(
+    palette: Sequence[str],
+    emoji_size: int,
+    render_source: EmojiRenderSource,
+) -> List[PaletteEntry]:
+    entries: List[PaletteEntry] = []
+
+    for emoji in palette:
+        tile = render_single_emoji_tile(emoji, emoji_size, render_source)
+        tile_array = np.asarray(tile, dtype=np.uint8)
+        mean_rgb, brightness, saturation, coverage = compute_cell_average(tile_array)
+        entries.append(
+            PaletteEntry(
+                emoji=emoji,
+                mean_rgb=mean_rgb,
+                brightness=brightness,
+                saturation=saturation,
+                alpha_coverage=coverage,
+            )
+        )
+    return entries
+
+
+def choose_best_emoji(
+    mean_rgb: np.ndarray,
+    brightness: float,
+    saturation: float,
+    alpha_coverage: float,
+    palette_entries: Sequence[PaletteEntry],
+) -> str:
+    best_score = math.inf
+    best_emoji = palette_entries[0].emoji
+
+    for entry in palette_entries:
+        color_distance = float(np.linalg.norm(mean_rgb - entry.mean_rgb))
+        brightness_distance = abs(brightness - entry.brightness)
+        saturation_distance = abs(saturation - entry.saturation) * 255.0
+        alpha_distance = abs(alpha_coverage - entry.alpha_coverage) * 100.0
+
+        score = (
+            color_distance * 1.0
+            + brightness_distance * 0.45
+            + saturation_distance * 0.35
+            + alpha_distance * 0.25
+        )
+
+        if score < best_score:
+            best_score = score
+            best_emoji = entry.emoji
+
+    return best_emoji
+
+
+def build_emoji_grid(
+    sampled_image: Image.Image,
+    palette_entries: Sequence[PaletteEntry],
+    alpha_threshold: float,
+) -> List[List[str | None]]:
+    image_array = np.asarray(sampled_image, dtype=np.uint8)
+    rows, columns = image_array.shape[:2]
+    grid: List[List[str | None]] = []
+
+    for y in range(rows):
+        row: List[str | None] = []
+        for x in range(columns):
+            mean_rgb, brightness, saturation, alpha_coverage = compute_cell_average(
+                image_array[y : y + 1, x : x + 1]
+            )
+            if alpha_coverage <= alpha_threshold:
+                row.append(None)
+                continue
+            row.append(
+                choose_best_emoji(
+                    mean_rgb,
+                    brightness,
+                    saturation,
+                    alpha_coverage,
+                    palette_entries,
+                )
+            )
+        grid.append(row)
+    return grid
+
+
+def render_emoji_canvas(
+    emoji_grid: Sequence[Sequence[str | None]],
+    emoji_size: int,
+    render_source: EmojiRenderSource,
+    background: Tuple[int, int, int, int],
+) -> Image.Image:
+    rows = len(emoji_grid)
+    columns = len(emoji_grid[0]) if rows else 0
+    canvas = Image.new(
+        "RGBA",
+        (columns * emoji_size, rows * emoji_size),
+        background,
+    )
+
+    # Cache pre-rendered emoji tiles so repeated emojis are pasted instead of redrawn.
+    tile_cache: dict[str, Image.Image] = {}
+
+    for y, row in enumerate(emoji_grid):
+        for x, emoji in enumerate(row):
+            if emoji is None:
+                continue
+            if emoji not in tile_cache:
+                tile_cache[emoji] = render_single_emoji_tile(emoji, emoji_size, render_source)
+            tile = tile_cache[emoji]
+            canvas.alpha_composite(tile, (x * emoji_size, y * emoji_size))
+
+    return canvas
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.emoji_size <= 0:
+        fail("--emoji-size must be greater than 0.")
+    if args.alpha_threshold < 0.0 or args.alpha_threshold > 1.0:
+        fail("--alpha-threshold must be between 0.0 and 1.0.")
+
+    output_path = Path(args.output)
+    if output_path.exists() and output_path.is_dir():
+        fail(f"Output path points to a directory: {output_path}")
+    if output_path.parent and not output_path.parent.exists():
+        fail(f"Output directory does not exist: {output_path.parent}")
+    if getattr(args, "video_output", None):
+        video_output_path = Path(args.video_output)
+        if video_output_path.exists() and video_output_path.is_dir():
+            fail(f"Video output path points to a directory: {video_output_path}")
+        if video_output_path.parent and not video_output_path.parent.exists():
+            fail(f"Video output directory does not exist: {video_output_path.parent}")
+
+
+def prepare_render(args: argparse.Namespace) -> tuple[Image.Image, Tuple[int, int, int, int], List[str], int, int, EmojiRenderSource]:
+    validate_args(args)
+
+    image = load_image(args.input)
+    background = parse_background(args.background)
+    palette = parse_palette(args.palette)
+
+    columns, rows = compute_grid_size(
+        width=image.width,
+        height=image.height,
+        columns=args.columns,
+        rows=args.rows,
+        scale=args.scale,
+        stretch=args.stretch,
+    )
+
+    render_source = resolve_render_source(args.font, args.emoji_size, args.emoji_source)
+    return image, background, palette, columns, rows, render_source
+
+
+def run_with_args(args: argparse.Namespace) -> RenderResult:
+    image, background, palette, columns, rows, render_source = prepare_render(args)
+    started_at = time.perf_counter()
+    sampled_image = resize_for_grid(image, columns, rows)
+    palette_entries = build_palette_entries(palette, args.emoji_size, render_source)
+    emoji_grid = build_emoji_grid(sampled_image, palette_entries, args.alpha_threshold)
+    canvas = render_emoji_canvas(emoji_grid, args.emoji_size, render_source, background)
+
+    output_path = Path(args.output)
+    try:
+        canvas.save(output_path, format="PNG")
+    except OSError as exc:
+        fail(f"Could not save output image '{output_path}': {exc}")
+    duration_seconds = time.perf_counter() - started_at
+    total_cells = columns * rows
+    filled_cells = sum(1 for row in emoji_grid for emoji in row if emoji is not None)
+    result = RenderResult(
+        output_path=output_path,
+        duration_seconds=duration_seconds,
+        total_cells=total_cells,
+        filled_cells=filled_cells,
+        columns=columns,
+        rows=rows,
+        palette_size=len(palette),
+        emoji_size=args.emoji_size,
+        emoji_source=render_source.kind,
+    )
+    append_render_history(result)
+    return result
+
+
+def build_gui_args(values: dict[str, str | bool]) -> argparse.Namespace:
+    def parse_optional_int(name: str) -> int | None:
+        value = str(values[name]).strip()
+        return int(value) if value else None
+
+    def parse_float(name: str) -> float:
+        value = str(values[name]).strip()
+        return float(value)
+
+    palette_value = str(values["palette"]).strip()
+    font_value = str(values["font"]).strip()
+
+    return argparse.Namespace(
+        input=str(values["input"]).strip(),
+        output=str(values["output"]).strip(),
+        columns=parse_optional_int("columns"),
+        rows=parse_optional_int("rows"),
+        emoji_size=int(str(values["emoji_size"]).strip()),
+        scale=parse_float("scale"),
+        palette=palette_value or None,
+        background=str(values["background"]).strip(),
+        font=font_value or None,
+        emoji_source=str(values["emoji_source"]).strip(),
+        stretch=bool(values["stretch"]),
+        alpha_threshold=parse_float("alpha_threshold"),
+        video_output=str(values["video_output"]).strip() or None,
+        video_fps=int(str(values["video_fps"]).strip()),
+        video_start_columns=int(str(values["video_start_columns"]).strip()),
+        video_max_columns=parse_optional_int("video_max_columns"),
+        video_step_columns=int(str(values["video_step_columns"]).strip()),
+    )
+
+
+def estimate_for_args(args: argparse.Namespace) -> tuple[RenderEstimate, dict[str, int | str]]:
+    image, _background, palette, columns, rows, render_source = prepare_render(args)
+    _ = image
+    profile = build_render_profile(
+        columns=columns,
+        rows=rows,
+        palette_size=len(palette),
+        emoji_size=args.emoji_size,
+        emoji_source=render_source.kind,
+    )
+    return estimate_duration(profile), profile
+
+
+def estimate_video_for_args(args: argparse.Namespace) -> tuple[float, int]:
+    image, _background, palette, _columns, _rows, render_source = prepare_render(args)
+    _ = image
+    max_columns = args.video_max_columns if args.video_max_columns is not None else (args.columns if args.columns is not None else 500)
+    frame_columns = build_frame_sequence(args.video_start_columns, max_columns, args.video_step_columns)
+    total_seconds = 0.0
+    for columns in frame_columns:
+        computed_columns, computed_rows = compute_grid_size(
+            width=image.width,
+            height=image.height,
+            columns=columns,
+            rows=None,
+            scale=args.scale,
+            stretch=False,
+        )
+        profile = build_render_profile(
+            columns=computed_columns,
+            rows=computed_rows,
+            palette_size=len(palette),
+            emoji_size=args.emoji_size,
+            emoji_source=render_source.kind,
+        )
+        total_seconds += estimate_duration(profile).seconds
+    return total_seconds, len(frame_columns)
+
+
+def launch_gui() -> None:
+    if tk is None or filedialog is None or messagebox is None or ttk is None:
+        fail(
+            "Tkinter is not available in this Python environment. "
+            "Install python3-tkinter/python3-tk or run the script with CLI parameters."
+        )
+
+    root = tk.Tk()
+    root.title("imgEMOJI")
+    root.geometry("820x560")
+    root.minsize(760, 520)
+
+    field_vars = {
+        "input": tk.StringVar(),
+        "output": tk.StringVar(value="result.png"),
+        "video_output": tk.StringVar(value="result_progress.gif"),
+        "columns": tk.StringVar(value="80"),
+        "rows": tk.StringVar(),
+        "emoji_size": tk.StringVar(value="20"),
+        "scale": tk.StringVar(value="1.0"),
+        "palette": tk.StringVar(),
+        "background": tk.StringVar(value="transparent"),
+        "font": tk.StringVar(),
+        "emoji_source": tk.StringVar(value="auto"),
+        "alpha_threshold": tk.StringVar(value="0.05"),
+        "video_fps": tk.StringVar(value="5"),
+        "video_start_columns": tk.StringVar(value="1"),
+        "video_max_columns": tk.StringVar(value="500"),
+        "video_step_columns": tk.StringVar(value="2"),
+    }
+    stretch_var = tk.BooleanVar(value=False)
+    status_var = tk.StringVar(value="Choisissez une image d'entrée et les paramètres, puis lancez le rendu.")
+    estimate_var = tk.StringVar(value="Estimation : n/a")
+    is_running = {"value": False}
+
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
+
+    container = ttk.Frame(root, padding=16)
+    container.grid(sticky="nsew")
+    container.columnconfigure(1, weight=1)
+
+    def add_row(row: int, label: str, key: str, browse: str | None = None) -> ttk.Entry:
+        ttk.Label(container, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=6)
+        entry = ttk.Entry(container, textvariable=field_vars[key])
+        entry.grid(row=row, column=1, sticky="ew", pady=6)
+        if browse == "open":
+            ttk.Button(
+                container,
+                text="Parcourir",
+                command=lambda: choose_input_file(),
+            ).grid(row=row, column=2, sticky="ew", padx=(12, 0), pady=6)
+        elif browse == "save":
+            ttk.Button(
+                container,
+                text="Parcourir",
+                command=lambda: choose_output_file(),
+            ).grid(row=row, column=2, sticky="ew", padx=(12, 0), pady=6)
+        elif browse == "font":
+            ttk.Button(
+                container,
+                text="Parcourir",
+                command=lambda: choose_font_file(),
+            ).grid(row=row, column=2, sticky="ew", padx=(12, 0), pady=6)
+        elif browse == "video":
+            ttk.Button(
+                container,
+                text="Parcourir",
+                command=lambda: choose_video_file(),
+            ).grid(row=row, column=2, sticky="ew", padx=(12, 0), pady=6)
+        return entry
+
+    def choose_input_file() -> None:
+        path = filedialog.askopenfilename(
+            title="Choisir l'image d'entrée",
+            filetypes=[
+                ("Images", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"),
+                ("Tous les fichiers", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        field_vars["input"].set(path)
+        input_path = Path(path)
+        if not field_vars["output"].get().strip() or field_vars["output"].get().strip() == "result.png":
+            field_vars["output"].set(str(input_path.with_name(f"{input_path.stem}_emoji.png")))
+        if not field_vars["video_output"].get().strip() or field_vars["video_output"].get().strip() == "result_progress.gif":
+            field_vars["video_output"].set(str(input_path.with_name(f"{input_path.stem}_progress.gif")))
+
+    def choose_output_file() -> None:
+        path = filedialog.asksaveasfilename(
+            title="Choisir le fichier de sortie",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("Tous les fichiers", "*.*")],
+        )
+        if path:
+            field_vars["output"].set(path)
+
+    def choose_font_file() -> None:
+        path = filedialog.askopenfilename(
+            title="Choisir une police emoji",
+            filetypes=[
+                ("Polices", "*.ttf *.ttc *.otf"),
+                ("Tous les fichiers", "*.*"),
+            ],
+        )
+        if path:
+            field_vars["font"].set(path)
+
+    def choose_video_file() -> None:
+        path = filedialog.asksaveasfilename(
+            title="Choisir le fichier vidéo/animation",
+            defaultextension=".gif",
+            filetypes=[("GIF animé", "*.gif"), ("MP4", "*.mp4"), ("Tous les fichiers", "*.*")],
+        )
+        if path:
+            field_vars["video_output"].set(path)
+
+    add_row(0, "Image d'entrée", "input", browse="open")
+    add_row(1, "Image de sortie", "output", browse="save")
+    add_row(2, "Sortie vidéo", "video_output", browse="video")
+    add_row(3, "Colonnes", "columns")
+    add_row(4, "Lignes", "rows")
+    add_row(5, "Taille emoji (px)", "emoji_size")
+    add_row(6, "Scale auto", "scale")
+    add_row(7, "Palette", "palette")
+    add_row(8, "Fond", "background")
+    add_row(9, "Police emoji", "font", browse="font")
+    add_row(10, "Seuil alpha", "alpha_threshold")
+    add_row(11, "FPS vidéo", "video_fps")
+    add_row(12, "Départ colonnes", "video_start_columns")
+    add_row(13, "Fin colonnes", "video_max_columns")
+    add_row(14, "Pas colonnes", "video_step_columns")
+
+    ttk.Label(container, text="Source emoji").grid(row=15, column=0, sticky="w", padx=(0, 12), pady=6)
+    source_combo = ttk.Combobox(
+        container,
+        textvariable=field_vars["emoji_source"],
+        values=("auto", "font", "twemoji"),
+        state="readonly",
+    )
+    source_combo.grid(row=15, column=1, sticky="ew", pady=6)
+
+    ttk.Checkbutton(
+        container,
+        text="Autoriser l'étirement si colonnes + lignes sont définies",
+        variable=stretch_var,
+    ).grid(row=16, column=0, columnspan=3, sticky="w", pady=(8, 6))
+
+    help_text = (
+        "Astuce : laissez 'Lignes' vide si vous fixez seulement 'Colonnes'. "
+        "Pour la vidéo, partez de 1, pas 2, et une fin comme 500 pour obtenir un dépixelisation progressive à 5 FPS."
+    )
+    ttk.Label(container, text=help_text, wraplength=760, justify="left").grid(
+        row=17, column=0, columnspan=3, sticky="w", pady=(6, 12)
+    )
+
+    status_label = ttk.Label(container, textvariable=status_var, wraplength=760, justify="left")
+    status_label.grid(row=19, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+    estimate_label = ttk.Label(container, textvariable=estimate_var, wraplength=760, justify="left")
+    estimate_label.grid(row=20, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+
+    def set_controls_state(state: str) -> None:
+        for child in container.winfo_children():
+            if isinstance(child, (ttk.Entry, ttk.Button, ttk.Combobox, ttk.Checkbutton)):
+                try:
+                    child.state([state] if state in ("disabled", "!disabled") else [])
+                except tk.TclError:
+                    pass
+
+    def collect_values() -> dict[str, str | bool]:
+        return {
+            "input": field_vars["input"].get(),
+            "output": field_vars["output"].get(),
+            "video_output": field_vars["video_output"].get(),
+            "columns": field_vars["columns"].get(),
+            "rows": field_vars["rows"].get(),
+            "emoji_size": field_vars["emoji_size"].get(),
+            "scale": field_vars["scale"].get(),
+            "palette": field_vars["palette"].get(),
+            "background": field_vars["background"].get(),
+            "font": field_vars["font"].get(),
+            "emoji_source": field_vars["emoji_source"].get(),
+            "alpha_threshold": field_vars["alpha_threshold"].get(),
+            "video_fps": field_vars["video_fps"].get(),
+            "video_start_columns": field_vars["video_start_columns"].get(),
+            "video_max_columns": field_vars["video_max_columns"].get(),
+            "video_step_columns": field_vars["video_step_columns"].get(),
+            "stretch": stretch_var.get(),
+        }
+
+    def refresh_estimate(*_args: object) -> None:
+        if is_running["value"]:
+            return
+        try:
+            args = build_gui_args(collect_values())
+            if not args.input.strip():
+                estimate_var.set("Estimation : choisissez d'abord une image d'entrée.")
+                return
+            estimate, profile = estimate_for_args(args)
+            try:
+                video_seconds, video_frames = estimate_video_for_args(args)
+                video_text = f" Vidéo : {format_duration(video_seconds)} pour {video_frames} frame(s)."
+            except Exception:
+                video_text = ""
+            estimate_var.set(
+                "Estimation : "
+                f"{format_duration(estimate.seconds)} pour {int(profile['total_cells'])} cases "
+                f"({int(profile['columns'])}x{int(profile['rows'])}), "
+                f"source {profile['emoji_source']}, "
+                f"historique {estimate.sample_count} échantillon(s), confiance {estimate.confidence}."
+                f"{video_text}"
+            )
+        except Exception:
+            estimate_var.set("Estimation : paramètres incomplets ou invalides.")
+
+    def on_render() -> None:
+        if is_running["value"]:
+            return
+
+        try:
+            args = build_gui_args(collect_values())
+        except ValueError as exc:
+            messagebox.showerror("Paramètres invalides", f"Valeur invalide : {exc}")
+            return
+
+        if not args.input.strip():
+            messagebox.showerror("Paramètres invalides", "Veuillez choisir une image d'entrée.")
+            return
+        if not args.output.strip():
+            messagebox.showerror("Paramètres invalides", "Veuillez choisir un fichier de sortie.")
+            return
+
+        try:
+            estimate, profile = estimate_for_args(args)
+        except SystemExit:
+            messagebox.showerror("Paramètres invalides", "Impossible d'estimer le rendu avec ces paramètres.")
+            return
+        except Exception as exc:
+            messagebox.showerror("Paramètres invalides", f"Impossible d'estimer le rendu : {exc}")
+            return
+
+        is_running["value"] = True
+        set_controls_state("disabled")
+        status_var.set(
+            "Rendu en cours... "
+            f"Estimation {format_duration(estimate.seconds)} pour {int(profile['total_cells'])} cases."
+        )
+
+        def worker() -> None:
+            try:
+                result = run_with_args(args)
+            except SystemExit:
+                root.after(0, lambda: on_error("Le rendu a échoué. Vérifiez les paramètres et la source emoji."))
+                return
+            except Exception as exc:  # pragma: no cover - defensive GUI fallback
+                root.after(0, lambda exc=exc: on_error(str(exc)))
+                return
+            root.after(0, lambda: on_success(result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_error(message: str) -> None:
+        is_running["value"] = False
+        set_controls_state("!disabled")
+        status_var.set(message)
+        messagebox.showerror("Erreur", message)
+
+    def on_success(result: RenderResult) -> None:
+        is_running["value"] = False
+        set_controls_state("!disabled")
+        status_var.set(
+            f"Rendu terminé : {result.output_path} | "
+            f"{result.filled_cells} emojis dessinés sur {result.total_cells} cases en {format_duration(result.duration_seconds)}."
+        )
+        refresh_estimate()
+        messagebox.showinfo(
+            "Succès",
+            "Image générée :\n"
+            f"{result.output_path}\n\n"
+            f"Temps réel : {format_duration(result.duration_seconds)}\n"
+            f"Cases totales : {result.total_cells}\n"
+            f"Emojis dessinés : {result.filled_cells}\n"
+            f"Grille : {result.columns}x{result.rows}\n"
+            f"Source emoji : {result.emoji_source}",
+        )
+
+    def on_video_render() -> None:
+        if is_running["value"]:
+            return
+
+        try:
+            args = build_gui_args(collect_values())
+        except ValueError as exc:
+            messagebox.showerror("Paramètres invalides", f"Valeur invalide : {exc}")
+            return
+
+        if not args.input.strip():
+            messagebox.showerror("Paramètres invalides", "Veuillez choisir une image d'entrée.")
+            return
+        if not args.video_output:
+            messagebox.showerror("Paramètres invalides", "Veuillez choisir un fichier de sortie vidéo.")
+            return
+
+        if args.video_max_columns is None:
+            args.video_max_columns = args.columns if args.columns is not None else 500
+
+        try:
+            estimated_seconds, frame_count = estimate_video_for_args(args)
+        except SystemExit:
+            messagebox.showerror("Paramètres invalides", "Impossible d'estimer la vidéo avec ces paramètres.")
+            return
+        except Exception as exc:
+            messagebox.showerror("Paramètres invalides", f"Impossible d'estimer la vidéo : {exc}")
+            return
+
+        is_running["value"] = True
+        set_controls_state("disabled")
+        status_var.set(
+            "Vidéo en cours... "
+            f"Estimation {format_duration(estimated_seconds)} pour {frame_count} frame(s) à {args.video_fps} FPS."
+        )
+
+        def worker() -> None:
+            try:
+                result = render_video_with_args(
+                    args=args,
+                    video_output=args.video_output,
+                    video_fps=args.video_fps,
+                    video_start_columns=args.video_start_columns,
+                    video_max_columns=args.video_max_columns,
+                    video_step_columns=args.video_step_columns,
+                )
+            except SystemExit:
+                root.after(0, lambda: on_error("La génération vidéo a échoué. Vérifiez les paramètres et la source emoji."))
+                return
+            except Exception as exc:  # pragma: no cover
+                root.after(0, lambda exc=exc: on_error(str(exc)))
+                return
+            root.after(0, lambda: on_video_success(result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_video_success(result: VideoResult) -> None:
+        is_running["value"] = False
+        set_controls_state("!disabled")
+        status_var.set(
+            f"Vidéo terminée : {result.output_path} | "
+            f"{result.frame_count} frame(s) en {format_duration(result.duration_seconds)}."
+        )
+        refresh_estimate()
+        messagebox.showinfo(
+            "Succès vidéo",
+            "Animation générée :\n"
+            f"{result.output_path}\n\n"
+            f"Temps réel : {format_duration(result.duration_seconds)}\n"
+            f"Frames : {result.frame_count}\n"
+            f"FPS : {result.fps}\n"
+            f"Colonnes : {result.start_columns} -> {result.max_columns} (pas {result.step_columns})\n"
+            f"Taille vidéo : {result.canvas_width}x{result.canvas_height}",
+        )
+
+    buttons = ttk.Frame(container)
+    buttons.grid(row=18, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+    buttons.columnconfigure(0, weight=1)
+    ttk.Button(buttons, text="Générer l'image", command=on_render).grid(row=0, column=0, sticky="w")
+    ttk.Button(buttons, text="Créer la vidéo", command=on_video_render).grid(row=0, column=1, sticky="w", padx=(12, 0))
+    ttk.Button(buttons, text="Quitter", command=root.destroy).grid(row=0, column=2, sticky="e")
+
+    for variable in field_vars.values():
+        variable.trace_add("write", refresh_estimate)
+    stretch_var.trace_add("write", refresh_estimate)
+    refresh_estimate()
+
+    root.mainloop()
+
+
+def main() -> None:
+    if len(sys.argv) == 1:
+        launch_gui()
+        return
+
+    args = parse_args()
+    if args.video_output and args.video_max_columns is None:
+        args.video_max_columns = args.columns if args.columns is not None else 500
+    try:
+        estimate, profile = estimate_for_args(args)
+        print(
+            "Estimate: "
+            f"{format_duration(estimate.seconds)} for {int(profile['total_cells'])} cells "
+            f"({int(profile['columns'])}x{int(profile['rows'])}), "
+            f"source={profile['emoji_source']}, samples={estimate.sample_count}, confidence={estimate.confidence}."
+        )
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+
+    if args.video_output:
+        try:
+            video_seconds, frame_count = estimate_video_for_args(args)
+            print(
+                "Video estimate: "
+                f"{format_duration(video_seconds)} for {frame_count} frames at {args.video_fps} fps."
+            )
+        except SystemExit:
+            raise
+        except Exception:
+            pass
+        result = render_video_with_args(
+            args=args,
+            video_output=args.video_output,
+            video_fps=args.video_fps,
+            video_start_columns=args.video_start_columns,
+            video_max_columns=args.video_max_columns,
+            video_step_columns=args.video_step_columns,
+        )
+        print(
+            "Video done: "
+            f"{result.output_path} | time={format_duration(result.duration_seconds)} | "
+            f"frames={result.frame_count} | fps={result.fps} | "
+            f"columns={result.start_columns}->{result.max_columns} step={result.step_columns}"
+        )
+        return
+
+    result = run_with_args(args)
+    print(
+        "Done: "
+        f"{result.output_path} | time={format_duration(result.duration_seconds)} | "
+        f"cells={result.total_cells} | emojis_drawn={result.filled_cells} | "
+        f"grid={result.columns}x{result.rows} | source={result.emoji_source}"
+    )
+
+
+if __name__ == "__main__":
+    main()
