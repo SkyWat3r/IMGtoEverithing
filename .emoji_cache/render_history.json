@@ -1,0 +1,35 @@
+[
+  {
+    "timestamp": 1776866944.8682802,
+    "duration_seconds": 0.2519048899994232,
+    "total_cells": 510,
+    "filled_cells": 510,
+    "columns": 30,
+    "rows": 17,
+    "palette_size": 36,
+    "emoji_size": 20,
+    "emoji_source": "font"
+  },
+  {
+    "timestamp": 1776866976.2468112,
+    "duration_seconds": 0.22372041500057094,
+    "total_cells": 510,
+    "filled_cells": 510,
+    "columns": 30,
+    "rows": 17,
+    "palette_size": 36,
+    "emoji_size": 20,
+    "emoji_source": "font"
+  },
+  {
+    "timestamp": 1776868065.071816,
+    "duration_seconds": 4.328036845996394,
+    "total_cells": 12600,
+    "filled_cells": 12600,
+    "columns": 150,
+    "rows": 84,
+    "palette_size": 36,
+    "emoji_size": 20,
+    "emoji_source": "twemoji"
+  }
+]
