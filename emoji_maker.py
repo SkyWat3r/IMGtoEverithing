@@ -128,9 +128,24 @@ class VideoResult:
     canvas_height: int
 
 
+@dataclass(frozen=True)
+class VideoToVideoResult:
+    output_path: Path
+    duration_seconds: float
+    frame_count: int
+    fps: int
+    columns: int
+    rows: int
+    canvas_width: int
+    canvas_height: int
+
+
+class EmojiMakerError(RuntimeError):
+    pass
+
+
 def fail(message: str) -> None:
-    print(f"Error: {message}", file=sys.stderr)
-    sys.exit(1)
+    raise EmojiMakerError(message)
 
 
 def format_duration(seconds: float) -> str:
@@ -147,6 +162,39 @@ def format_duration(seconds: float) -> str:
 
 def has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
+
+
+def has_ffprobe() -> bool:
+    return shutil.which("ffprobe") is not None
+
+
+def build_mp4_encode_command(
+    *,
+    framerate: int,
+    input_pattern: str,
+    output_path: str,
+) -> List[str]:
+    return [
+        "ffmpeg",
+        "-y",
+        "-framerate",
+        str(framerate),
+        "-i",
+        input_pattern,
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ]
 
 
 def ensure_history_dir() -> None:
@@ -536,7 +584,7 @@ def find_emoji_font(font_path: str | None, size: int) -> ImageFont.FreeTypeFont:
 def try_find_emoji_font(font_path: str | None, size: int) -> ImageFont.FreeTypeFont | None:
     try:
         return find_emoji_font(font_path, size)
-    except SystemExit:
+    except EmojiMakerError:
         return None
 
 
@@ -671,6 +719,70 @@ def pad_frame_to_size(frame: Image.Image, width: int, height: int, background: T
     return canvas
 
 
+def get_video_metadata(video_path: str) -> dict[str, float | int]:
+    candidate = Path(video_path)
+    if not candidate.is_file():
+        fail(f"Input video does not exist: {candidate}")
+    if not has_ffprobe():
+        fail("ffprobe is required for video-to-video mode. Install ffmpeg/ffprobe and retry.")
+
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-count_frames",
+        "-show_entries",
+        "stream=width,height,avg_frame_rate,nb_read_frames,duration",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        str(candidate),
+    ]
+    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        fail(f"ffprobe failed to inspect '{candidate}': {result.stderr.strip()}")
+
+    try:
+        payload = json.loads(result.stdout)
+        stream = payload["streams"][0]
+    except (KeyError, IndexError, json.JSONDecodeError) as exc:
+        fail(f"Could not parse ffprobe output for '{candidate}': {exc}")
+        raise AssertionError("unreachable")
+
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    duration_raw = stream.get("duration") or payload.get("format", {}).get("duration") or 0
+    duration = float(duration_raw or 0.0)
+    frame_rate_raw = str(stream.get("avg_frame_rate") or "0/0")
+    try:
+        numerator, denominator = frame_rate_raw.split("/", 1)
+        fps = float(numerator) / float(denominator) if float(denominator) != 0 else 0.0
+    except (ValueError, ZeroDivisionError):
+        fps = 0.0
+
+    frame_count_raw = stream.get("nb_read_frames")
+    if frame_count_raw not in (None, "N/A"):
+        frame_count = int(frame_count_raw)
+    else:
+        frame_count = int(round(duration * fps)) if duration > 0 and fps > 0 else 0
+
+    if width <= 0 or height <= 0:
+        fail(f"Could not determine video size for '{candidate}'.")
+    if duration <= 0:
+        fail(f"Could not determine duration for '{candidate}'.")
+
+    return {
+        "width": width,
+        "height": height,
+        "duration": duration,
+        "fps": fps,
+        "frame_count": max(1, frame_count),
+    }
+
+
 def render_canvas_for_grid(
     image: Image.Image,
     background: Tuple[int, int, int, int],
@@ -745,17 +857,11 @@ def render_video_with_args(
             temp_path = Path(temp_dir)
             for index, frame in enumerate(frames):
                 frame.convert("RGBA").save(temp_path / f"frame_{index:04d}.png", format="PNG")
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-framerate",
-                str(video_fps),
-                "-i",
-                str(temp_path / "frame_%04d.png"),
-                "-pix_fmt",
-                "yuv420p",
-                str(output_path),
-            ]
+            cmd = build_mp4_encode_command(
+                framerate=video_fps,
+                input_pattern=str(temp_path / "frame_%04d.png"),
+                output_path=str(output_path),
+            )
             result = subprocess.run(cmd, check=False, capture_output=True, text=True)
             if result.returncode != 0:
                 fail(f"ffmpeg failed to create the MP4: {result.stderr.strip()}")
@@ -782,6 +888,155 @@ def render_video_with_args(
         step_columns=video_step_columns,
         canvas_width=max_width,
         canvas_height=max_height,
+    )
+
+
+def build_video_to_video_profile(
+    *,
+    video_input: str,
+    args: argparse.Namespace,
+) -> tuple[dict[str, int | float | str], dict[str, int | str], int]:
+    metadata = get_video_metadata(video_input)
+    background = parse_background(args.background)
+    _ = background
+    palette = parse_palette(args.palette)
+    render_source = resolve_render_source(args.font, args.emoji_size, args.emoji_source)
+    columns, rows = compute_grid_size(
+        width=int(metadata["width"]),
+        height=int(metadata["height"]),
+        columns=args.columns,
+        rows=args.rows,
+        scale=args.scale,
+        stretch=args.stretch,
+    )
+    output_fps = args.video_fps
+    if output_fps <= 0:
+        fail("--video-fps must be greater than 0.")
+    estimated_frame_count = max(1, int(round(float(metadata["duration"]) * output_fps)))
+    profile = build_render_profile(
+        columns=columns,
+        rows=rows,
+        palette_size=len(palette),
+        emoji_size=args.emoji_size,
+        emoji_source=render_source.kind,
+    )
+    return metadata, profile, estimated_frame_count
+
+
+def estimate_video_to_video_for_args(args: argparse.Namespace, video_input: str) -> tuple[float, int, dict[str, int | str]]:
+    metadata, profile, estimated_frame_count = build_video_to_video_profile(video_input=video_input, args=args)
+    per_frame_estimate = estimate_duration(profile)
+    total_seconds = (per_frame_estimate.seconds * estimated_frame_count) + max(1.5, estimated_frame_count * 0.02)
+    _ = metadata
+    return total_seconds, estimated_frame_count, profile
+
+
+def render_video_to_video_with_args(
+    args: argparse.Namespace,
+    video_input: str,
+    video_output: str,
+) -> VideoToVideoResult:
+    if not has_ffmpeg():
+        fail("ffmpeg is required for video-to-video mode. Install ffmpeg and retry.")
+    metadata, _profile, _estimated_frame_count = build_video_to_video_profile(video_input=video_input, args=args)
+    background = parse_background(args.background)
+    palette = parse_palette(args.palette)
+    render_source = resolve_render_source(args.font, args.emoji_size, args.emoji_source)
+    columns, rows = compute_grid_size(
+        width=int(metadata["width"]),
+        height=int(metadata["height"]),
+        columns=args.columns,
+        rows=args.rows,
+        scale=args.scale,
+        stretch=args.stretch,
+    )
+    output_fps = args.video_fps
+    palette_entries = build_palette_entries(palette, args.emoji_size, render_source)
+    output_path = Path(video_output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    started_at = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="emoji_v2v_in_") as input_dir, tempfile.TemporaryDirectory(prefix="emoji_v2v_out_") as output_dir:
+        input_path = Path(input_dir)
+        output_frames_path = Path(output_dir)
+
+        extract_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_input),
+            "-vf",
+            f"fps={output_fps}",
+            str(input_path / "frame_%06d.png"),
+        ]
+        extract_result = subprocess.run(extract_cmd, check=False, capture_output=True, text=True)
+        if extract_result.returncode != 0:
+            fail(f"ffmpeg failed to extract frames from '{video_input}': {extract_result.stderr.strip()}")
+
+        extracted_frames = sorted(input_path.glob("frame_*.png"))
+        if not extracted_frames:
+            fail(f"No frames were extracted from '{video_input}'.")
+        actual_frame_count = len(extracted_frames)
+
+        canvas_width = columns * args.emoji_size
+        canvas_height = rows * args.emoji_size
+        for index, frame_path in enumerate(extracted_frames):
+            frame_image = Image.open(frame_path).convert("RGBA")
+            canvas, _filled_cells = render_canvas_for_grid(
+                image=frame_image,
+                background=background,
+                render_source=render_source,
+                palette_entries=palette_entries,
+                emoji_size=args.emoji_size,
+                alpha_threshold=args.alpha_threshold,
+                columns=columns,
+                rows=rows,
+            )
+            canvas.save(output_frames_path / f"frame_{index:06d}.png", format="PNG")
+
+        silent_video_path = output_frames_path / "rendered_video.mp4"
+        encode_cmd = build_mp4_encode_command(
+            framerate=output_fps,
+            input_pattern=str(output_frames_path / "frame_%06d.png"),
+            output_path=str(silent_video_path),
+        )
+        encode_result = subprocess.run(encode_cmd, check=False, capture_output=True, text=True)
+        if encode_result.returncode != 0:
+            fail(f"ffmpeg failed to encode the rendered frames: {encode_result.stderr.strip()}")
+
+        mux_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(silent_video_path),
+            "-i",
+            str(video_input),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a?",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        mux_result = subprocess.run(mux_cmd, check=False, capture_output=True, text=True)
+        if mux_result.returncode != 0:
+            shutil.copy2(silent_video_path, output_path)
+
+    return VideoToVideoResult(
+        output_path=output_path,
+        duration_seconds=time.perf_counter() - started_at,
+        frame_count=actual_frame_count,
+        fps=output_fps,
+        columns=columns,
+        rows=rows,
+        canvas_width=columns * args.emoji_size,
+        canvas_height=rows * args.emoji_size,
     )
 
 
@@ -915,28 +1170,70 @@ def build_emoji_grid(
 ) -> List[List[str | None]]:
     image_array = np.asarray(sampled_image, dtype=np.uint8)
     rows, columns = image_array.shape[:2]
-    grid: List[List[str | None]] = []
 
-    for y in range(rows):
-        row: List[str | None] = []
-        for x in range(columns):
-            mean_rgb, brightness, saturation, alpha_coverage = compute_cell_average(
-                image_array[y : y + 1, x : x + 1]
-            )
-            if alpha_coverage <= alpha_threshold:
-                row.append(None)
-                continue
-            row.append(
-                choose_best_emoji(
-                    mean_rgb,
-                    brightness,
-                    saturation,
-                    alpha_coverage,
-                    palette_entries,
-                )
-            )
-        grid.append(row)
-    return grid
+    alpha = image_array[..., 3].astype(np.float32) / 255.0
+    coverage = (alpha > 0.01).astype(np.float32)
+    alpha_coverage = np.maximum(coverage, alpha)
+
+    rgb = image_array[..., :3].astype(np.float32)
+    mean_rgb = np.divide(
+        rgb * alpha[..., None],
+        alpha[..., None],
+        out=np.zeros_like(rgb),
+        where=alpha[..., None] > 1e-6,
+    )
+    brightness = (
+        (0.299 * mean_rgb[..., 0])
+        + (0.587 * mean_rgb[..., 1])
+        + (0.114 * mean_rgb[..., 2])
+    )
+
+    rgb_norm = mean_rgb / 255.0
+    max_value = np.max(rgb_norm, axis=2)
+    min_value = np.min(rgb_norm, axis=2)
+    saturation = np.divide(
+        max_value - min_value,
+        max_value,
+        out=np.zeros_like(max_value),
+        where=max_value > 1e-6,
+    )
+
+    palette_rgb = np.stack([entry.mean_rgb for entry in palette_entries], axis=0).astype(np.float32)
+    palette_brightness = np.asarray([entry.brightness for entry in palette_entries], dtype=np.float32)
+    palette_saturation = np.asarray([entry.saturation for entry in palette_entries], dtype=np.float32)
+    palette_alpha = np.asarray([entry.alpha_coverage for entry in palette_entries], dtype=np.float32)
+    palette_emojis = [entry.emoji for entry in palette_entries]
+
+    flat_rgb = mean_rgb.reshape(-1, 3)
+    flat_brightness = brightness.reshape(-1)
+    flat_saturation = saturation.reshape(-1)
+    flat_alpha = alpha_coverage.reshape(-1)
+    valid_mask = flat_alpha > alpha_threshold
+
+    flat_grid: List[str | None] = [None] * (rows * columns)
+    if np.any(valid_mask):
+        valid_rgb = flat_rgb[valid_mask]
+        valid_brightness = flat_brightness[valid_mask][:, None]
+        valid_saturation = flat_saturation[valid_mask][:, None]
+        valid_alpha = flat_alpha[valid_mask][:, None]
+
+        color_distance = np.linalg.norm(valid_rgb[:, None, :] - palette_rgb[None, :, :], axis=2)
+        brightness_distance = np.abs(valid_brightness - palette_brightness[None, :])
+        saturation_distance = np.abs(valid_saturation - palette_saturation[None, :]) * 255.0
+        alpha_distance = np.abs(valid_alpha - palette_alpha[None, :]) * 100.0
+
+        scores = (
+            color_distance
+            + (brightness_distance * 0.45)
+            + (saturation_distance * 0.35)
+            + (alpha_distance * 0.25)
+        )
+        best_indices = np.argmin(scores, axis=1)
+        valid_positions = np.flatnonzero(valid_mask)
+        for position, palette_index in zip(valid_positions.tolist(), best_indices.tolist()):
+            flat_grid[position] = palette_emojis[palette_index]
+
+    return [flat_grid[row_index * columns : (row_index + 1) * columns] for row_index in range(rows)]
 
 
 def render_emoji_canvas(
@@ -985,6 +1282,16 @@ def validate_args(args: argparse.Namespace) -> None:
             fail(f"Video output path points to a directory: {video_output_path}")
         if video_output_path.parent and not video_output_path.parent.exists():
             fail(f"Video output directory does not exist: {video_output_path.parent}")
+    if getattr(args, "video_to_video_input", None):
+        video_input_path = Path(args.video_to_video_input)
+        if not video_input_path.is_file():
+            fail(f"Video input does not exist: {video_input_path}")
+    if getattr(args, "video_to_video_output", None):
+        video_to_video_output_path = Path(args.video_to_video_output)
+        if video_to_video_output_path.exists() and video_to_video_output_path.is_dir():
+            fail(f"Video-to-video output path points to a directory: {video_to_video_output_path}")
+        if video_to_video_output_path.parent and not video_to_video_output_path.parent.exists():
+            fail(f"Video-to-video output directory does not exist: {video_to_video_output_path.parent}")
 
 
 def prepare_render(args: argparse.Namespace) -> tuple[Image.Image, Tuple[int, int, int, int], List[str], int, int, EmojiRenderSource]:
@@ -1053,6 +1360,8 @@ def build_gui_args(values: dict[str, str | bool]) -> argparse.Namespace:
     return argparse.Namespace(
         input=str(values["input"]).strip(),
         output=str(values["output"]).strip(),
+        video_to_video_input=str(values["video_to_video_input"]).strip() or None,
+        video_to_video_output=str(values["video_to_video_output"]).strip() or None,
         columns=parse_optional_int("columns"),
         rows=parse_optional_int("rows"),
         emoji_size=int(str(values["emoji_size"]).strip()),
@@ -1119,13 +1428,34 @@ def launch_gui() -> None:
 
     root = tk.Tk()
     root.title("imgEMOJI")
-    root.geometry("820x560")
-    root.minsize(760, 520)
+    root.geometry("980x700")
+    root.minsize(820, 560)
+
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    root.configure(bg="#f3f6fb")
+    style.configure("App.TFrame", background="#f3f6fb")
+    style.configure("Hero.TLabel", background="#f3f6fb", font=("TkDefaultFont", 18, "bold"))
+    style.configure("Muted.TLabel", background="#f3f6fb", foreground="#516074")
+    style.configure("Section.TLabelframe", background="#ffffff")
+    style.configure("Section.TLabelframe.Label", background="#ffffff", font=("TkDefaultFont", 10, "bold"))
+    style.configure("Card.TFrame", background="#ffffff")
+    style.configure("FieldTitle.TLabel", background="#ffffff", font=("TkDefaultFont", 10, "bold"))
+    style.configure("FieldHelp.TLabel", background="#ffffff", foreground="#5b6576")
+    style.configure("Info.TLabel", background="#ffffff", foreground="#435066")
+    style.configure("Status.TLabel", background="#f3f6fb", foreground="#243041")
+    style.configure("TNotebook", background="#f3f6fb", borderwidth=0)
+    style.configure("TNotebook.Tab", padding=(16, 10), font=("TkDefaultFont", 10, "bold"))
 
     field_vars = {
         "input": tk.StringVar(),
         "output": tk.StringVar(value="result.png"),
         "video_output": tk.StringVar(value="result_progress.gif"),
+        "video_to_video_input": tk.StringVar(),
+        "video_to_video_output": tk.StringVar(value="result_video_emoji.mp4"),
         "columns": tk.StringVar(value="80"),
         "rows": tk.StringVar(),
         "emoji_size": tk.StringVar(value="20"),
@@ -1141,45 +1471,151 @@ def launch_gui() -> None:
         "video_step_columns": tk.StringVar(value="2"),
     }
     stretch_var = tk.BooleanVar(value=False)
-    status_var = tk.StringVar(value="Choisissez une image d'entrée et les paramètres, puis lancez le rendu.")
+    status_var = tk.StringVar(value="Choisissez un mode puis configurez les paramètres communs.")
     estimate_var = tk.StringVar(value="Estimation : n/a")
     is_running = {"value": False}
+    current_mode = {"value": "image_to_image"}
 
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
 
-    container = ttk.Frame(root, padding=16)
-    container.grid(sticky="nsew")
-    container.columnconfigure(1, weight=1)
+    outer = ttk.Frame(root, style="App.TFrame")
+    outer.grid(sticky="nsew")
+    outer.columnconfigure(0, weight=1)
+    outer.rowconfigure(0, weight=1)
 
-    def add_row(row: int, label: str, key: str, browse: str | None = None) -> ttk.Entry:
-        ttk.Label(container, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=6)
-        entry = ttk.Entry(container, textvariable=field_vars[key])
-        entry.grid(row=row, column=1, sticky="ew", pady=6)
+    canvas = tk.Canvas(
+        outer,
+        background="#f3f6fb",
+        highlightthickness=0,
+        bd=0,
+    )
+    canvas.grid(row=0, column=0, sticky="nsew")
+
+    scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    scrollbar.grid(row=0, column=1, sticky="ns")
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    container = ttk.Frame(canvas, padding=22, style="App.TFrame")
+    container.columnconfigure(0, weight=1)
+    container.columnconfigure(0, weight=1)
+    container.rowconfigure(1, weight=1)
+    canvas_window = canvas.create_window((0, 0), window=container, anchor="nw")
+
+    def update_scroll_region(_event: object | None = None) -> None:
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def update_canvas_width(event: object) -> None:
+        width = getattr(event, "width", None)
+        if width is not None:
+            canvas.itemconfigure(canvas_window, width=width)
+
+    def on_mousewheel(event: object) -> None:
+        delta = getattr(event, "delta", 0)
+        if delta:
+            canvas.yview_scroll(int(-delta / 120), "units")
+
+    def on_linux_scroll_up(_event: object) -> None:
+        canvas.yview_scroll(-3, "units")
+
+    def on_linux_scroll_down(_event: object) -> None:
+        canvas.yview_scroll(3, "units")
+
+    container.bind("<Configure>", update_scroll_region)
+    canvas.bind("<Configure>", update_canvas_width)
+    canvas.bind_all("<MouseWheel>", on_mousewheel)
+    canvas.bind_all("<Button-4>", on_linux_scroll_up)
+    canvas.bind_all("<Button-5>", on_linux_scroll_down)
+
+    header = ttk.Frame(container, style="App.TFrame")
+    header.grid(row=0, column=0, sticky="ew")
+    header.columnconfigure(0, weight=1)
+    ttk.Label(header, text="imgEMOJI", style="Hero.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        header,
+        text="Trois modes séparés, des paramètres communs, et des champs expliqués sans surcharger l'écran.",
+        style="Muted.TLabel",
+        wraplength=920,
+        justify="left",
+    ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+    main_frame = ttk.Frame(container, style="App.TFrame")
+    main_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+    main_frame.columnconfigure(0, weight=1)
+    main_frame.rowconfigure(1, weight=1)
+
+    shared_frame = ttk.LabelFrame(main_frame, text="Paramètres communs", padding=16, style="Section.TLabelframe")
+    shared_frame.grid(row=0, column=0, sticky="ew")
+    shared_frame.columnconfigure(0, weight=1)
+
+    def add_row(
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        description: str,
+        key: str,
+        browse: str | None = None,
+        width: int = 18,
+        stretch: bool = False,
+    ) -> ttk.Entry:
+        row_frame = ttk.Frame(parent, style="Card.TFrame")
+        row_frame.grid(row=row, column=0, sticky="ew", pady=5)
+        row_frame.columnconfigure(0, weight=1)
+
+        text_frame = ttk.Frame(row_frame, style="Card.TFrame")
+        text_frame.grid(row=0, column=0, sticky="ew", padx=(0, 18))
+        text_frame.columnconfigure(0, weight=1)
+        ttk.Label(text_frame, text=label, style="FieldTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            text_frame,
+            text=description,
+            style="FieldHelp.TLabel",
+            wraplength=560,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        control_frame = ttk.Frame(row_frame, style="Card.TFrame")
+        control_frame.grid(row=0, column=1, sticky="e")
+        if stretch:
+            control_frame.columnconfigure(0, weight=1)
+        entry = ttk.Entry(control_frame, textvariable=field_vars[key], width=width)
+        entry.grid(row=0, column=0, sticky="ew" if stretch else "w")
         if browse == "open":
             ttk.Button(
-                container,
+                control_frame,
                 text="Parcourir",
                 command=lambda: choose_input_file(),
-            ).grid(row=row, column=2, sticky="ew", padx=(12, 0), pady=6)
+            ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        elif browse == "video_input":
+            ttk.Button(
+                control_frame,
+                text="Parcourir",
+                command=lambda: choose_video_input_file(),
+            ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "save":
             ttk.Button(
-                container,
+                control_frame,
                 text="Parcourir",
                 command=lambda: choose_output_file(),
-            ).grid(row=row, column=2, sticky="ew", padx=(12, 0), pady=6)
+            ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        elif browse == "mp4_save":
+            ttk.Button(
+                control_frame,
+                text="Parcourir",
+                command=lambda: choose_video_to_video_output_file(),
+            ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "font":
             ttk.Button(
-                container,
+                control_frame,
                 text="Parcourir",
                 command=lambda: choose_font_file(),
-            ).grid(row=row, column=2, sticky="ew", padx=(12, 0), pady=6)
+            ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "video":
             ttk.Button(
-                container,
+                control_frame,
                 text="Parcourir",
                 command=lambda: choose_video_file(),
-            ).grid(row=row, column=2, sticky="ew", padx=(12, 0), pady=6)
+            ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         return entry
 
     def choose_input_file() -> None:
@@ -1228,52 +1664,248 @@ def launch_gui() -> None:
         if path:
             field_vars["video_output"].set(path)
 
-    add_row(0, "Image d'entrée", "input", browse="open")
-    add_row(1, "Image de sortie", "output", browse="save")
-    add_row(2, "Sortie vidéo", "video_output", browse="video")
-    add_row(3, "Colonnes", "columns")
-    add_row(4, "Lignes", "rows")
-    add_row(5, "Taille emoji (px)", "emoji_size")
-    add_row(6, "Scale auto", "scale")
-    add_row(7, "Palette", "palette")
-    add_row(8, "Fond", "background")
-    add_row(9, "Police emoji", "font", browse="font")
-    add_row(10, "Seuil alpha", "alpha_threshold")
-    add_row(11, "FPS vidéo", "video_fps")
-    add_row(12, "Départ colonnes", "video_start_columns")
-    add_row(13, "Fin colonnes", "video_max_columns")
-    add_row(14, "Pas colonnes", "video_step_columns")
+    def choose_video_input_file() -> None:
+        path = filedialog.askopenfilename(
+            title="Choisir la vidéo d'entrée",
+            filetypes=[("MP4", "*.mp4"), ("Vidéos", "*.mp4 *.mov *.mkv *.webm"), ("Tous les fichiers", "*.*")],
+        )
+        if not path:
+            return
+        field_vars["video_to_video_input"].set(path)
+        input_path = Path(path)
+        if not field_vars["video_to_video_output"].get().strip() or field_vars["video_to_video_output"].get().strip() == "result_video_emoji.mp4":
+            field_vars["video_to_video_output"].set(str(input_path.with_name(f"{input_path.stem}_emoji.mp4")))
 
-    ttk.Label(container, text="Source emoji").grid(row=15, column=0, sticky="w", padx=(0, 12), pady=6)
+    def choose_video_to_video_output_file() -> None:
+        path = filedialog.asksaveasfilename(
+            title="Choisir la vidéo de sortie",
+            defaultextension=".mp4",
+            filetypes=[("MP4", "*.mp4"), ("Tous les fichiers", "*.*")],
+        )
+        if path:
+            field_vars["video_to_video_output"].set(path)
+
+    add_row(
+        shared_frame, 0, "Image d'entrée",
+        "Le fichier source à transformer en mosaïque emoji.",
+        "input", browse="open", width=38, stretch=True,
+    )
+    add_row(
+        shared_frame, 1, "Colonnes",
+        "Le niveau de détail horizontal. Plus c'est grand, plus le rendu est fin.",
+        "columns", width=10,
+    )
+    add_row(
+        shared_frame, 2, "Lignes",
+        "Optionnel. Laisse vide pour garder automatiquement les proportions.",
+        "rows", width=10,
+    )
+    add_row(
+        shared_frame, 3, "Taille emoji",
+        "La taille d'un emoji dans l'image finale, en pixels.",
+        "emoji_size", width=10,
+    )
+    add_row(
+        shared_frame, 4, "Scale auto",
+        "Utilisé si colonnes et lignes sont vides. 1.0 = comportement normal.",
+        "scale", width=10,
+    )
+    add_row(
+        shared_frame, 5, "Palette",
+        "Liste d'emojis séparés par des virgules, ou chemin vers un fichier texte.",
+        "palette", width=34,
+    )
+    add_row(
+        shared_frame, 6, "Fond",
+        "Couleur des zones vides : `transparent`, `white`, `#112233`, etc.",
+        "background", width=16,
+    )
+    add_row(
+        shared_frame, 7, "Police emoji",
+        "Optionnel. À renseigner si l'auto-détection ne trouve pas de bonne police.",
+        "font", browse="font", width=34,
+    )
+    add_row(
+        shared_frame, 8, "Seuil alpha",
+        "Ignore les zones presque transparentes. 0.05 est une bonne base.",
+        "alpha_threshold", width=10,
+    )
+
+    source_row = ttk.Frame(shared_frame, style="Card.TFrame")
+    source_row.grid(row=9, column=0, sticky="ew", pady=5)
+    source_row.columnconfigure(0, weight=1)
+    source_text = ttk.Frame(source_row, style="Card.TFrame")
+    source_text.grid(row=0, column=0, sticky="ew", padx=(0, 18))
+    source_text.columnconfigure(0, weight=1)
+    ttk.Label(source_text, text="Source emoji", style="FieldTitle.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        source_text,
+        text="`auto` choisit seul, `font` force une police locale, `twemoji` utilise les assets Twemoji.",
+        style="FieldHelp.TLabel",
+        wraplength=560,
+        justify="left",
+    ).grid(row=1, column=0, sticky="w", pady=(2, 0))
     source_combo = ttk.Combobox(
-        container,
+        source_row,
         textvariable=field_vars["emoji_source"],
         values=("auto", "font", "twemoji"),
         state="readonly",
+        width=14,
     )
-    source_combo.grid(row=15, column=1, sticky="ew", pady=6)
+    source_combo.grid(row=0, column=1, sticky="e")
 
+    stretch_row = ttk.Frame(shared_frame, style="Card.TFrame")
+    stretch_row.grid(row=10, column=0, sticky="ew", pady=(8, 4))
+    stretch_row.columnconfigure(0, weight=1)
     ttk.Checkbutton(
-        container,
+        stretch_row,
         text="Autoriser l'étirement si colonnes + lignes sont définies",
         variable=stretch_var,
-    ).grid(row=16, column=0, columnspan=3, sticky="w", pady=(8, 6))
+    ).grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        stretch_row,
+        text="À activer seulement si tu veux forcer une grille qui ne respecte pas les proportions d'origine.",
+        style="FieldHelp.TLabel",
+        wraplength=860,
+        justify="left",
+    ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
     help_text = (
-        "Astuce : laissez 'Lignes' vide si vous fixez seulement 'Colonnes'. "
-        "Pour la vidéo, partez de 1, pas 2, et une fin comme 500 pour obtenir un dépixelisation progressive à 5 FPS."
+        "Les champs ici sont partagés par `Image -> Image` et `Image -> Vidéo`. "
+        "Tu règles la matière commune une fois, puis tu choisis seulement la sortie dans l'onglet voulu."
     )
-    ttk.Label(container, text=help_text, wraplength=760, justify="left").grid(
-        row=17, column=0, columnspan=3, sticky="w", pady=(6, 12)
+    ttk.Label(shared_frame, text=help_text, wraplength=860, justify="left").grid(
+        row=11, column=0, sticky="w", pady=(8, 0)
     )
 
-    status_label = ttk.Label(container, textvariable=status_var, wraplength=760, justify="left")
-    status_label.grid(row=19, column=0, columnspan=3, sticky="ew", pady=(12, 0))
-    estimate_label = ttk.Label(container, textvariable=estimate_var, wraplength=760, justify="left")
-    estimate_label.grid(row=20, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+    notebook = ttk.Notebook(main_frame)
+    notebook.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
+
+    image_tab = ttk.Frame(notebook, padding=18, style="App.TFrame")
+    video_tab = ttk.Frame(notebook, padding=18, style="App.TFrame")
+    future_tab = ttk.Frame(notebook, padding=18, style="App.TFrame")
+    for tab in (image_tab, video_tab, future_tab):
+        tab.columnconfigure(0, weight=1)
+
+    notebook.add(image_tab, text="Image -> Image")
+    notebook.add(video_tab, text="Image -> Vidéo")
+    notebook.add(future_tab, text="Vidéo -> Vidéo")
+
+    image_card = ttk.LabelFrame(image_tab, text="Sortie image", padding=16, style="Section.TLabelframe")
+    image_card.grid(row=0, column=0, sticky="ew")
+    image_card.columnconfigure(0, weight=1)
+    add_row(
+        image_card, 0, "Image de sortie",
+        "Le PNG final généré par le mode `image -> image`.",
+        "output", browse="save", width=38, stretch=True,
+    )
+    ttk.Label(
+        image_card,
+        text="Tu peux utiliser ce mode pour tester rapidement une palette ou régler la densité avant de passer à une animation.",
+        style="Info.TLabel",
+        wraplength=760,
+        justify="left",
+    ).grid(row=1, column=0, sticky="w", pady=(10, 0))
+
+    image_buttons = ttk.Frame(image_tab)
+    image_buttons.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+    image_buttons.columnconfigure(1, weight=1)
+    ttk.Button(image_buttons, text="Générer l'image", command=lambda: on_render()).grid(row=0, column=0, sticky="w")
+    ttk.Button(image_buttons, text="Quitter", command=root.destroy).grid(row=0, column=2, sticky="e")
+
+    video_card = ttk.LabelFrame(video_tab, text="Sortie vidéo", padding=16, style="Section.TLabelframe")
+    video_card.grid(row=0, column=0, sticky="ew")
+    video_card.columnconfigure(0, weight=1)
+    add_row(
+        video_card, 0, "Fichier vidéo",
+        "Le GIF ou MP4 de sortie.",
+        "video_output", browse="video", width=38, stretch=True,
+    )
+    add_row(
+        video_card, 1, "FPS vidéo",
+        "Nombre d'images par seconde. Plus haut = animation plus fluide.",
+        "video_fps", width=10,
+    )
+    add_row(
+        video_card, 2, "Départ colonnes",
+        "La première frame démarre avec cette densité.",
+        "video_start_columns", width=10,
+    )
+    add_row(
+        video_card, 3, "Fin colonnes",
+        "La dernière frame finit à cette densité. Laisse 500 si tu veux aller loin.",
+        "video_max_columns", width=10,
+    )
+    add_row(
+        video_card, 4, "Pas colonnes",
+        "L'écart entre deux frames. Petit pas = progression plus douce.",
+        "video_step_columns", width=10,
+    )
+    ttk.Label(
+        video_card,
+        text="Réglage conseillé : départ 1, pas 2, fin 500 pour une dépixelisation progressive simple.",
+        style="Info.TLabel",
+        wraplength=760,
+        justify="left",
+    ).grid(row=5, column=0, sticky="w", pady=(10, 0))
+
+    video_buttons = ttk.Frame(video_tab)
+    video_buttons.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+    video_buttons.columnconfigure(1, weight=1)
+    ttk.Button(video_buttons, text="Créer la vidéo", command=lambda: on_video_render()).grid(row=0, column=0, sticky="w")
+    ttk.Button(video_buttons, text="Quitter", command=root.destroy).grid(row=0, column=2, sticky="e")
+
+    future_card = ttk.LabelFrame(future_tab, text="Vidéo -> Vidéo", padding=18, style="Section.TLabelframe")
+    future_card.grid(row=0, column=0, sticky="nsew")
+    future_card.columnconfigure(0, weight=1)
+    add_row(
+        future_card, 0, "Vidéo d'entrée",
+        "Le MP4 source à transformer frame par frame en version emoji.",
+        "video_to_video_input", browse="video_input", width=38, stretch=True,
+    )
+    add_row(
+        future_card, 1, "Vidéo de sortie",
+        "Le MP4 final généré par le mode `vidéo -> vidéo`.",
+        "video_to_video_output", browse="mp4_save", width=38, stretch=True,
+    )
+    add_row(
+        future_card, 2, "FPS vidéo",
+        "Nombre d'images par seconde à extraire puis réencoder dans le MP4 final.",
+        "video_fps", width=10,
+    )
+    ttk.Label(
+        future_card,
+        text=(
+            "Les paramètres communs au-dessus s'appliquent aussi ici : colonnes, palette, taille emoji, "
+            "fond, source emoji, etc."
+        ),
+        style="Info.TLabel",
+        justify="left",
+        wraplength=760,
+    ).grid(row=3, column=0, sticky="w", pady=(10, 0))
+
+    future_buttons = ttk.Frame(future_tab)
+    future_buttons.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+    future_buttons.columnconfigure(1, weight=1)
+    ttk.Button(future_buttons, text="Créer la vidéo emoji", command=lambda: on_video_to_video_render()).grid(row=0, column=0, sticky="w")
+    ttk.Button(future_buttons, text="Quitter", command=root.destroy).grid(row=0, column=2, sticky="e")
+
+    footer = ttk.Frame(main_frame, style="App.TFrame")
+    footer.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+    footer.columnconfigure(0, weight=1)
+    status_label = ttk.Label(footer, textvariable=status_var, wraplength=900, justify="left", style="Status.TLabel")
+    status_label.grid(row=0, column=0, sticky="ew")
+    estimate_label = ttk.Label(footer, textvariable=estimate_var, wraplength=900, justify="left", style="Muted.TLabel")
+    estimate_label.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+
+    def walk_children(widget: tk.Misc) -> list[tk.Misc]:
+        nodes = [widget]
+        for child in widget.winfo_children():
+            nodes.extend(walk_children(child))
+        return nodes
 
     def set_controls_state(state: str) -> None:
-        for child in container.winfo_children():
+        for child in walk_children(container):
             if isinstance(child, (ttk.Entry, ttk.Button, ttk.Combobox, ttk.Checkbutton)):
                 try:
                     child.state([state] if state in ("disabled", "!disabled") else [])
@@ -1285,6 +1917,8 @@ def launch_gui() -> None:
             "input": field_vars["input"].get(),
             "output": field_vars["output"].get(),
             "video_output": field_vars["video_output"].get(),
+            "video_to_video_input": field_vars["video_to_video_input"].get(),
+            "video_to_video_output": field_vars["video_to_video_output"].get(),
             "columns": field_vars["columns"].get(),
             "rows": field_vars["rows"].get(),
             "emoji_size": field_vars["emoji_size"].get(),
@@ -1301,28 +1935,53 @@ def launch_gui() -> None:
             "stretch": stretch_var.get(),
         }
 
+    def get_active_mode() -> str:
+        selected_tab = notebook.select()
+        if selected_tab == str(image_tab):
+            return "image_to_image"
+        if selected_tab == str(video_tab):
+            return "image_to_video"
+        return "video_to_video"
+
     def refresh_estimate(*_args: object) -> None:
         if is_running["value"]:
             return
+        current_mode["value"] = get_active_mode()
         try:
             args = build_gui_args(collect_values())
-            if not args.input.strip():
-                estimate_var.set("Estimation : choisissez d'abord une image d'entrée.")
-                return
-            estimate, profile = estimate_for_args(args)
-            try:
+            if current_mode["value"] == "image_to_image":
+                if not args.input or not args.input.strip():
+                    estimate_var.set("Estimation : choisissez d'abord une image d'entrée.")
+                    return
+                estimate, profile = estimate_for_args(args)
+                estimate_var.set(
+                    "Estimation image : "
+                    f"{format_duration(estimate.seconds)} pour {int(profile['total_cells'])} cases "
+                    f"({int(profile['columns'])}x{int(profile['rows'])}), "
+                    f"source {profile['emoji_source']}, "
+                    f"historique {estimate.sample_count} échantillon(s), confiance {estimate.confidence}."
+                )
+            elif current_mode["value"] == "image_to_video":
+                if not args.input or not args.input.strip():
+                    estimate_var.set("Estimation : choisissez d'abord une image d'entrée.")
+                    return
                 video_seconds, video_frames = estimate_video_for_args(args)
-                video_text = f" Vidéo : {format_duration(video_seconds)} pour {video_frames} frame(s)."
-            except Exception:
-                video_text = ""
-            estimate_var.set(
-                "Estimation : "
-                f"{format_duration(estimate.seconds)} pour {int(profile['total_cells'])} cases "
-                f"({int(profile['columns'])}x{int(profile['rows'])}), "
-                f"source {profile['emoji_source']}, "
-                f"historique {estimate.sample_count} échantillon(s), confiance {estimate.confidence}."
-                f"{video_text}"
-            )
+                estimate_var.set(
+                    "Estimation vidéo : "
+                    f"{format_duration(video_seconds)} pour {video_frames} frame(s) à {args.video_fps} FPS."
+                )
+            else:
+                if not args.video_to_video_input or not args.video_to_video_input.strip():
+                    estimate_var.set("Estimation : choisissez d'abord une vidéo d'entrée.")
+                    return
+                video_seconds, video_frames, profile = estimate_video_to_video_for_args(args, args.video_to_video_input)
+                estimate_var.set(
+                    "Estimation vidéo -> vidéo : "
+                    f"{format_duration(video_seconds)} pour {video_frames} frame(s) à {args.video_fps} FPS, "
+                    f"grille {int(profile['columns'])}x{int(profile['rows'])}."
+                )
+        except EmojiMakerError as exc:
+            estimate_var.set(f"Estimation : {exc}")
         except Exception:
             estimate_var.set("Estimation : paramètres incomplets ou invalides.")
 
@@ -1345,8 +2004,8 @@ def launch_gui() -> None:
 
         try:
             estimate, profile = estimate_for_args(args)
-        except SystemExit:
-            messagebox.showerror("Paramètres invalides", "Impossible d'estimer le rendu avec ces paramètres.")
+        except EmojiMakerError as exc:
+            messagebox.showerror("Paramètres invalides", str(exc))
             return
         except Exception as exc:
             messagebox.showerror("Paramètres invalides", f"Impossible d'estimer le rendu : {exc}")
@@ -1362,8 +2021,8 @@ def launch_gui() -> None:
         def worker() -> None:
             try:
                 result = run_with_args(args)
-            except SystemExit:
-                root.after(0, lambda: on_error("Le rendu a échoué. Vérifiez les paramètres et la source emoji."))
+            except EmojiMakerError as exc:
+                root.after(0, lambda exc=exc: on_error(str(exc)))
                 return
             except Exception as exc:  # pragma: no cover - defensive GUI fallback
                 root.after(0, lambda exc=exc: on_error(str(exc)))
@@ -1419,8 +2078,8 @@ def launch_gui() -> None:
 
         try:
             estimated_seconds, frame_count = estimate_video_for_args(args)
-        except SystemExit:
-            messagebox.showerror("Paramètres invalides", "Impossible d'estimer la vidéo avec ces paramètres.")
+        except EmojiMakerError as exc:
+            messagebox.showerror("Paramètres invalides", str(exc))
             return
         except Exception as exc:
             messagebox.showerror("Paramètres invalides", f"Impossible d'estimer la vidéo : {exc}")
@@ -1443,8 +2102,8 @@ def launch_gui() -> None:
                     video_max_columns=args.video_max_columns,
                     video_step_columns=args.video_step_columns,
                 )
-            except SystemExit:
-                root.after(0, lambda: on_error("La génération vidéo a échoué. Vérifiez les paramètres et la source emoji."))
+            except EmojiMakerError as exc:
+                root.after(0, lambda exc=exc: on_error(str(exc)))
                 return
             except Exception as exc:  # pragma: no cover
                 root.after(0, lambda exc=exc: on_error(str(exc)))
@@ -1472,16 +2131,80 @@ def launch_gui() -> None:
             f"Taille vidéo : {result.canvas_width}x{result.canvas_height}",
         )
 
-    buttons = ttk.Frame(container)
-    buttons.grid(row=18, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-    buttons.columnconfigure(0, weight=1)
-    ttk.Button(buttons, text="Générer l'image", command=on_render).grid(row=0, column=0, sticky="w")
-    ttk.Button(buttons, text="Créer la vidéo", command=on_video_render).grid(row=0, column=1, sticky="w", padx=(12, 0))
-    ttk.Button(buttons, text="Quitter", command=root.destroy).grid(row=0, column=2, sticky="e")
+    def on_video_to_video_render() -> None:
+        if is_running["value"]:
+            return
+
+        try:
+            args = build_gui_args(collect_values())
+        except ValueError as exc:
+            messagebox.showerror("Paramètres invalides", f"Valeur invalide : {exc}")
+            return
+
+        if not args.video_to_video_input:
+            messagebox.showerror("Paramètres invalides", "Veuillez choisir une vidéo d'entrée.")
+            return
+        if not args.video_to_video_output:
+            messagebox.showerror("Paramètres invalides", "Veuillez choisir une vidéo de sortie.")
+            return
+
+        try:
+            estimated_seconds, frame_count, profile = estimate_video_to_video_for_args(args, args.video_to_video_input)
+        except EmojiMakerError as exc:
+            messagebox.showerror("Paramètres invalides", str(exc))
+            return
+        except Exception as exc:
+            messagebox.showerror("Paramètres invalides", f"Impossible d'estimer la conversion vidéo -> vidéo : {exc}")
+            return
+
+        is_running["value"] = True
+        set_controls_state("disabled")
+        status_var.set(
+            "Conversion vidéo -> vidéo en cours... "
+            f"Estimation {format_duration(estimated_seconds)} pour {frame_count} frame(s), "
+            f"grille {int(profile['columns'])}x{int(profile['rows'])}."
+        )
+
+        def worker() -> None:
+            try:
+                result = render_video_to_video_with_args(
+                    args=args,
+                    video_input=args.video_to_video_input,
+                    video_output=args.video_to_video_output,
+                )
+            except EmojiMakerError as exc:
+                root.after(0, lambda exc=exc: on_error(str(exc)))
+                return
+            except Exception as exc:  # pragma: no cover
+                root.after(0, lambda exc=exc: on_error(str(exc)))
+                return
+            root.after(0, lambda: on_video_to_video_success(result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_video_to_video_success(result: VideoToVideoResult) -> None:
+        is_running["value"] = False
+        set_controls_state("!disabled")
+        status_var.set(
+            f"Vidéo -> vidéo terminée : {result.output_path} | "
+            f"{result.frame_count} frame(s) en {format_duration(result.duration_seconds)}."
+        )
+        refresh_estimate()
+        messagebox.showinfo(
+            "Succès vidéo -> vidéo",
+            "Vidéo générée :\n"
+            f"{result.output_path}\n\n"
+            f"Temps réel : {format_duration(result.duration_seconds)}\n"
+            f"Frames : {result.frame_count}\n"
+            f"FPS : {result.fps}\n"
+            f"Grille : {result.columns}x{result.rows}\n"
+            f"Taille vidéo : {result.canvas_width}x{result.canvas_height}",
+        )
 
     for variable in field_vars.values():
         variable.trace_add("write", refresh_estimate)
     stretch_var.trace_add("write", refresh_estimate)
+    notebook.bind("<<NotebookTabChanged>>", refresh_estimate)
     refresh_estimate()
 
     root.mainloop()
@@ -1503,8 +2226,9 @@ def main() -> None:
             f"({int(profile['columns'])}x{int(profile['rows'])}), "
             f"source={profile['emoji_source']}, samples={estimate.sample_count}, confidence={estimate.confidence}."
         )
-    except SystemExit:
-        raise
+    except EmojiMakerError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
     except Exception:
         pass
 
@@ -1515,8 +2239,9 @@ def main() -> None:
                 "Video estimate: "
                 f"{format_duration(video_seconds)} for {frame_count} frames at {args.video_fps} fps."
             )
-        except SystemExit:
-            raise
+        except EmojiMakerError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
         except Exception:
             pass
         result = render_video_with_args(
