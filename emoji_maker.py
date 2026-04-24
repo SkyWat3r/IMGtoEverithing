@@ -19,15 +19,21 @@ import time
 import subprocess
 import sys
 import threading
+import unicodedata
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import Callable, List, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageColor, ImageDraw, ImageFont
+
+try:
+    from PIL import ImageTk
+except ImportError:
+    ImageTk = None
 
 try:
     import tkinter as tk
@@ -77,7 +83,57 @@ PALETTE_SPLIT_RE = re.compile(r"[\s,]+")
 TWEMOJI_BASE_URL = "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72"
 TWEMOJI_CACHE_DIR = Path(".emoji_cache") / "twemoji" / "72x72"
 RUN_HISTORY_PATH = Path(".emoji_cache") / "render_history.json"
+GUI_SETTINGS_PATH = Path(".emoji_cache") / "gui_settings.json"
+UNICODE_EMOJI_TEST_CACHE_PATH = Path(".emoji_cache") / "unicode_emoji_test.txt"
+UNICODE_EMOJI_TEST_URL = "https://unicode.org/Public/emoji/latest/emoji-test.txt"
+PALETTE_METRICS_CACHE_DIR = Path(".emoji_cache") / "palette_metrics"
 MAX_HISTORY_ENTRIES = 200
+INITIAL_BROWSER_RESULTS = 48
+LOAD_MORE_BROWSER_RESULTS = 48
+
+SQUARE_FIRST_DEFAULT_PALETTE = [
+    "\u2B1B",
+    "\u2B1C",
+    "\U0001F7E5",
+    "\U0001F7E7",
+    "\U0001F7E8",
+    "\U0001F7E9",
+    "\U0001F7E6",
+    "\U0001F7EA",
+    "\U0001F7EB",
+    "\u2764\uFE0F",
+    "\U0001F9E1",
+    "\U0001F49B",
+    "\U0001F49A",
+    "\U0001F499",
+    "\U0001F49C",
+    "\U0001F34E",
+    "\U0001F34A",
+    "\U0001F34B",
+    "\U0001F95D",
+    "\U0001FADB",
+    "\U0001F347",
+    "\U0001F353",
+    "\U0001F338",
+    "\U0001F33B",
+    "\U0001F332",
+    "\U0001F30A",
+    "\u2601\uFE0F",
+    "\U0001F319",
+    "\u2B50",
+    "\U0001F525",
+    "\u26A1",
+    "\u2744\uFE0F",
+    "\U0001FAA8",
+    "\U0001F975",
+    "\U0001F9E0",
+    "\U0001F438",
+]
+
+DEFAULT_BANNED_EMOJIS: list[str] = [
+    "\U0001F7EB",
+    "\U0001FADB",
+]
 
 
 @dataclass(frozen=True)
@@ -142,6 +198,9 @@ class VideoToVideoResult:
 
 class EmojiMakerError(RuntimeError):
     pass
+
+
+ProgressCallback = Callable[[float, str], None]
 
 
 def fail(message: str) -> None:
@@ -218,6 +277,68 @@ def save_render_history(history: Sequence[dict]) -> None:
     trimmed_history = list(history)[-MAX_HISTORY_ENTRIES:]
     RUN_HISTORY_PATH.write_text(
         json.dumps(trimmed_history, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_gui_settings() -> dict[str, object]:
+    if not GUI_SETTINGS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(GUI_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_gui_settings(settings: dict[str, object]) -> None:
+    GUI_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    GUI_SETTINGS_PATH.write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def get_palette_metrics_cache_path(render_source: EmojiRenderSource, emoji_size: int) -> Path:
+    if render_source.kind == "twemoji":
+        cache_name = f"twemoji_{emoji_size}.json"
+    else:
+        font_name = "font"
+        if render_source.font is not None:
+            font_name = Path(getattr(render_source.font, "path", "font")).stem or "font"
+        safe_font_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", font_name)
+        cache_name = f"font_{safe_font_name}_{emoji_size}.json"
+    return PALETTE_METRICS_CACHE_DIR / cache_name
+
+
+def load_palette_metrics_cache(render_source: EmojiRenderSource, emoji_size: int) -> dict[str, object]:
+    cache_path = get_palette_metrics_cache_path(render_source, emoji_size)
+    if not cache_path.exists():
+        return {"version": 1, "entries": {}, "skipped": []}
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "entries": {}, "skipped": []}
+    if not isinstance(payload, dict):
+        return {"version": 1, "entries": {}, "skipped": []}
+    entries = payload.get("entries")
+    skipped = payload.get("skipped")
+    return {
+        "version": 1,
+        "entries": entries if isinstance(entries, dict) else {},
+        "skipped": skipped if isinstance(skipped, list) else [],
+    }
+
+
+def save_palette_metrics_cache(
+    render_source: EmojiRenderSource,
+    emoji_size: int,
+    cache_payload: dict[str, object],
+) -> None:
+    PALETTE_METRICS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = get_palette_metrics_cache_path(render_source, emoji_size)
+    cache_path.write_text(
+        json.dumps(cache_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -354,6 +475,13 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--banned-palette",
+        help=(
+            "Emoji list to exclude from the final palette. Accepts the same formats "
+            "as --palette."
+        ),
+    )
+    parser.add_argument(
         "--background",
         default="transparent",
         help="Background color for empty areas, e.g. transparent, white, black, #112233. Default: transparent.",
@@ -428,11 +556,11 @@ def parse_background(value: str) -> Tuple[int, int, int, int]:
     return (rgb[0], rgb[1], rgb[2], 255)
 
 
-def parse_palette(palette_arg: str | None) -> List[str]:
-    if palette_arg is None:
-        palette = list(DEFAULT_PALETTE)
+def parse_emoji_list(value: str | None, default: Sequence[str] | None = None) -> List[str]:
+    if value is None:
+        tokens = list(default or [])
     else:
-        candidate_path = Path(palette_arg)
+        candidate_path = Path(value)
         if candidate_path.is_file():
             content = candidate_path.read_text(encoding="utf-8").strip()
             tokens = [
@@ -440,25 +568,118 @@ def parse_palette(palette_arg: str | None) -> List[str]:
                 for token in PALETTE_SPLIT_RE.split(content)
                 if token.strip()
             ]
-            palette = tokens
         else:
             tokens = [
                 token.strip()
-                for token in PALETTE_SPLIT_RE.split(palette_arg)
+                for token in PALETTE_SPLIT_RE.split(value)
                 if token.strip()
             ]
-            palette = tokens
 
     unique_palette = []
     seen = set()
-    for emoji in palette:
+    for emoji in tokens:
         if emoji not in seen:
             unique_palette.append(emoji)
             seen.add(emoji)
 
-    if not unique_palette:
-        fail("Palette is empty. Provide at least one emoji.")
     return unique_palette
+
+
+def build_default_palette_for_render_source(render_source_kind: str) -> List[str]:
+    if render_source_kind == "twemoji":
+        return get_twemoji_browser_catalog()
+    return list(SQUARE_FIRST_DEFAULT_PALETTE)
+
+
+def parse_palette(
+    palette_arg: str | None,
+    banned_arg: str | None = None,
+    default_palette: Sequence[str] | None = None,
+) -> List[str]:
+    palette = parse_emoji_list(palette_arg, default=default_palette or DEFAULT_PALETTE)
+    banned = set(parse_emoji_list(banned_arg, default=DEFAULT_BANNED_EMOJIS))
+    if banned:
+        palette = [emoji for emoji in palette if emoji not in banned]
+
+    if not palette:
+        fail("Palette is empty. Provide at least one emoji.")
+    return palette
+
+
+def encode_emoji_list(emojis: Sequence[str]) -> str:
+    return " ".join(emoji for emoji in emojis if emoji)
+
+
+def describe_emoji(emoji: str) -> str:
+    parts: List[str] = []
+    for char in emoji:
+        if ord(char) == 0xFE0F:
+            continue
+        try:
+            parts.append(unicodedata.name(char).title())
+        except ValueError:
+            parts.append(f"U+{ord(char):04X}")
+    return " + ".join(parts) if parts else "Unknown Emoji"
+
+
+def fetch_unicode_emoji_test() -> str:
+    if UNICODE_EMOJI_TEST_CACHE_PATH.exists():
+        try:
+            return UNICODE_EMOJI_TEST_CACHE_PATH.read_text(encoding="utf-8")
+        except OSError:
+            pass
+
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(
+                UNICODE_EMOJI_TEST_URL,
+                headers={"User-Agent": "emoji_maker/1.0"},
+            ),
+            timeout=30,
+        ) as response:
+            content = response.read().decode("utf-8")
+    except (urllib.error.URLError, TimeoutError, UnicodeDecodeError) as exc:
+        fail(
+            "Could not fetch the Unicode emoji catalog used by the Twemoji browser. "
+            f"Last error: {exc}"
+        )
+    UNICODE_EMOJI_TEST_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    UNICODE_EMOJI_TEST_CACHE_PATH.write_text(content, encoding="utf-8")
+    return content
+
+
+def parse_unicode_emoji_test(content: str) -> List[str]:
+    emojis: List[str] = []
+    seen: set[str] = set()
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        left, _sep, right = line.partition("#")
+        if ";" not in left:
+            continue
+        _codepoints, _semi, status = left.partition(";")
+        if status.strip() != "fully-qualified":
+            continue
+        match = re.search(r"#\s+(\S+)\s+E[0-9.]+", line)
+        if not match:
+            continue
+        emoji = match.group(1).strip()
+        if emoji and emoji not in seen:
+            emojis.append(emoji)
+            seen.add(emoji)
+    return emojis
+
+
+def get_twemoji_browser_catalog() -> List[str]:
+    try:
+        catalog = parse_unicode_emoji_test(fetch_unicode_emoji_test())
+        if catalog:
+            return catalog
+    except EmojiMakerError:
+        pass
+    fallback = list(SQUARE_FIRST_DEFAULT_PALETTE) + list(DEFAULT_PALETTE) + list(DEFAULT_BANNED_EMOJIS)
+    return parse_emoji_list(encode_emoji_list(fallback))
 
 
 def fontconfig_match(family: str) -> str | None:
@@ -792,10 +1013,28 @@ def render_canvas_for_grid(
     alpha_threshold: float,
     columns: int,
     rows: int,
+    progress_callback: ProgressCallback | None = None,
+    progress_range: Tuple[float, float] = (0.0, 1.0),
 ) -> tuple[Image.Image, int]:
+    progress_start, progress_end = progress_range
+    if progress_callback is not None:
+        progress_callback(progress_start, f"Preparation grille {columns}x{rows}")
     sampled_image = resize_for_grid(image, columns, rows)
     emoji_grid = build_emoji_grid(sampled_image, palette_entries, alpha_threshold)
-    canvas = render_emoji_canvas(emoji_grid, emoji_size, render_source, background)
+    if progress_callback is not None:
+        midpoint = progress_start + ((progress_end - progress_start) * 0.35)
+        progress_callback(midpoint, f"Correspondance emojis {columns}x{rows}")
+    canvas = render_emoji_canvas(
+        emoji_grid,
+        emoji_size,
+        render_source,
+        background,
+        progress_callback=progress_callback,
+        progress_range=(
+            progress_start + ((progress_end - progress_start) * 0.45),
+            progress_end,
+        ),
+    )
     filled_cells = sum(1 for row in emoji_grid for emoji in row if emoji is not None)
     return canvas, filled_cells
 
@@ -807,12 +1046,21 @@ def render_video_with_args(
     video_start_columns: int,
     video_max_columns: int,
     video_step_columns: int,
+    progress_callback: ProgressCallback | None = None,
 ) -> VideoResult:
     if video_fps <= 0:
         fail("--video-fps must be greater than 0.")
 
     image, background, palette, _columns, _rows, render_source = prepare_render(args)
-    palette_entries = build_palette_entries(palette, args.emoji_size, render_source)
+    if progress_callback is not None:
+        progress_callback(0.02, "Chargement image")
+    palette_entries = build_palette_entries(
+        palette,
+        args.emoji_size,
+        render_source,
+        progress_callback=progress_callback,
+        progress_range=(0.04, 0.45),
+    )
     frame_columns = build_frame_sequence(video_start_columns, video_max_columns, video_step_columns)
 
     frame_specs: List[tuple[int, int]] = []
@@ -833,7 +1081,10 @@ def render_video_with_args(
 
     frames: List[Image.Image] = []
     started_at = time.perf_counter()
-    for columns, rows in frame_specs:
+    total_frames = max(1, len(frame_specs))
+    for frame_index, (columns, rows) in enumerate(frame_specs, start=1):
+        frame_start = 0.48 + (0.40 * ((frame_index - 1) / total_frames))
+        frame_end = 0.48 + (0.40 * (frame_index / total_frames))
         frame, _filled_cells = render_canvas_for_grid(
             image=image,
             background=background,
@@ -843,6 +1094,8 @@ def render_video_with_args(
             alpha_threshold=args.alpha_threshold,
             columns=columns,
             rows=rows,
+            progress_callback=progress_callback,
+            progress_range=(frame_start, frame_end),
         )
         frames.append(pad_frame_to_size(frame, max_width, max_height, background))
 
@@ -855,6 +1108,8 @@ def render_video_with_args(
             fail("ffmpeg is required to export MP4. Use a .gif output or install ffmpeg.")
         with tempfile.TemporaryDirectory(prefix="emoji_video_") as temp_dir:
             temp_path = Path(temp_dir)
+            if progress_callback is not None:
+                progress_callback(0.90, "Ecriture frames video")
             for index, frame in enumerate(frames):
                 frame.convert("RGBA").save(temp_path / f"frame_{index:04d}.png", format="PNG")
             cmd = build_mp4_encode_command(
@@ -866,6 +1121,8 @@ def render_video_with_args(
             if result.returncode != 0:
                 fail(f"ffmpeg failed to create the MP4: {result.stderr.strip()}")
     else:
+        if progress_callback is not None:
+            progress_callback(0.90, "Encodage GIF")
         duration_ms = max(20, int(round(1000 / video_fps)))
         first_frame, *other_frames = [frame.convert("RGBA") for frame in frames]
         first_frame.save(
@@ -877,6 +1134,8 @@ def render_video_with_args(
             disposal=2,
             format="GIF",
         )
+    if progress_callback is not None:
+        progress_callback(1.0, "Video terminee")
 
     return VideoResult(
         output_path=output_path,
@@ -899,8 +1158,12 @@ def build_video_to_video_profile(
     metadata = get_video_metadata(video_input)
     background = parse_background(args.background)
     _ = background
-    palette = parse_palette(args.palette)
     render_source = resolve_render_source(args.font, args.emoji_size, args.emoji_source)
+    palette = parse_palette(
+        args.palette,
+        args.banned_palette,
+        default_palette=build_default_palette_for_render_source(render_source.kind),
+    )
     columns, rows = compute_grid_size(
         width=int(metadata["width"]),
         height=int(metadata["height"]),
@@ -935,13 +1198,18 @@ def render_video_to_video_with_args(
     args: argparse.Namespace,
     video_input: str,
     video_output: str,
+    progress_callback: ProgressCallback | None = None,
 ) -> VideoToVideoResult:
     if not has_ffmpeg():
         fail("ffmpeg is required for video-to-video mode. Install ffmpeg and retry.")
     metadata, _profile, _estimated_frame_count = build_video_to_video_profile(video_input=video_input, args=args)
     background = parse_background(args.background)
-    palette = parse_palette(args.palette)
     render_source = resolve_render_source(args.font, args.emoji_size, args.emoji_source)
+    palette = parse_palette(
+        args.palette,
+        args.banned_palette,
+        default_palette=build_default_palette_for_render_source(render_source.kind),
+    )
     columns, rows = compute_grid_size(
         width=int(metadata["width"]),
         height=int(metadata["height"]),
@@ -951,7 +1219,15 @@ def render_video_to_video_with_args(
         stretch=args.stretch,
     )
     output_fps = args.video_fps
-    palette_entries = build_palette_entries(palette, args.emoji_size, render_source)
+    if progress_callback is not None:
+        progress_callback(0.02, "Analyse video source")
+    palette_entries = build_palette_entries(
+        palette,
+        args.emoji_size,
+        render_source,
+        progress_callback=progress_callback,
+        progress_range=(0.04, 0.35),
+    )
     output_path = Path(video_output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -977,11 +1253,16 @@ def render_video_to_video_with_args(
         if not extracted_frames:
             fail(f"No frames were extracted from '{video_input}'.")
         actual_frame_count = len(extracted_frames)
+        if progress_callback is not None:
+            progress_callback(0.40, f"Frames extraites {actual_frame_count}")
 
         canvas_width = columns * args.emoji_size
         canvas_height = rows * args.emoji_size
+        total_frames = max(1, len(extracted_frames))
         for index, frame_path in enumerate(extracted_frames):
             frame_image = Image.open(frame_path).convert("RGBA")
+            frame_start = 0.42 + (0.40 * (index / total_frames))
+            frame_end = 0.42 + (0.40 * ((index + 1) / total_frames))
             canvas, _filled_cells = render_canvas_for_grid(
                 image=frame_image,
                 background=background,
@@ -991,10 +1272,14 @@ def render_video_to_video_with_args(
                 alpha_threshold=args.alpha_threshold,
                 columns=columns,
                 rows=rows,
+                progress_callback=progress_callback,
+                progress_range=(frame_start, frame_end),
             )
             canvas.save(output_frames_path / f"frame_{index:06d}.png", format="PNG")
 
         silent_video_path = output_frames_path / "rendered_video.mp4"
+        if progress_callback is not None:
+            progress_callback(0.86, "Encodage video")
         encode_cmd = build_mp4_encode_command(
             framerate=output_fps,
             input_pattern=str(output_frames_path / "frame_%06d.png"),
@@ -1027,6 +1312,8 @@ def render_video_to_video_with_args(
         mux_result = subprocess.run(mux_cmd, check=False, capture_output=True, text=True)
         if mux_result.returncode != 0:
             shutil.copy2(silent_video_path, output_path)
+    if progress_callback is not None:
+        progress_callback(1.0, "Video terminee")
 
     return VideoToVideoResult(
         output_path=output_path,
@@ -1114,11 +1401,68 @@ def build_palette_entries(
     palette: Sequence[str],
     emoji_size: int,
     render_source: EmojiRenderSource,
+    progress_callback: ProgressCallback | None = None,
+    progress_range: Tuple[float, float] = (0.0, 1.0),
 ) -> List[PaletteEntry]:
     entries: List[PaletteEntry] = []
+    skipped_emojis: List[str] = []
+    progress_start, progress_end = progress_range
+    total_emojis = max(1, len(palette))
+    cache_payload = load_palette_metrics_cache(render_source, emoji_size)
+    cached_entries = cache_payload["entries"] if isinstance(cache_payload.get("entries"), dict) else {}
+    cached_skipped = {
+        str(item)
+        for item in cache_payload.get("skipped", [])
+        if isinstance(item, str)
+    }
+    cache_dirty = False
 
-    for emoji in palette:
-        tile = render_single_emoji_tile(emoji, emoji_size, render_source)
+    for index, emoji in enumerate(palette, start=1):
+        cached_entry = cached_entries.get(emoji)
+        if isinstance(cached_entry, dict):
+            mean_rgb = cached_entry.get("mean_rgb")
+            brightness = cached_entry.get("brightness")
+            saturation = cached_entry.get("saturation")
+            coverage = cached_entry.get("alpha_coverage")
+            if (
+                isinstance(mean_rgb, list)
+                and len(mean_rgb) == 3
+                and all(isinstance(value, (int, float)) for value in mean_rgb)
+                and isinstance(brightness, (int, float))
+                and isinstance(saturation, (int, float))
+                and isinstance(coverage, (int, float))
+            ):
+                entries.append(
+                    PaletteEntry(
+                        emoji=emoji,
+                        mean_rgb=np.asarray(mean_rgb, dtype=np.float32),
+                        brightness=float(brightness),
+                        saturation=float(saturation),
+                        alpha_coverage=float(coverage),
+                    )
+                )
+                if progress_callback is not None:
+                    fraction = progress_start + ((progress_end - progress_start) * (index / total_emojis))
+                    progress_callback(fraction, f"Preparation palette {index}/{total_emojis}")
+                continue
+        if emoji in cached_skipped and render_source.kind == "twemoji":
+            skipped_emojis.append(emoji)
+            if progress_callback is not None:
+                fraction = progress_start + ((progress_end - progress_start) * (index / total_emojis))
+                progress_callback(fraction, f"Preparation palette Twemoji {index}/{total_emojis}")
+            continue
+        try:
+            tile = render_single_emoji_tile(emoji, emoji_size, render_source)
+        except EmojiMakerError:
+            if render_source.kind == "twemoji":
+                skipped_emojis.append(emoji)
+                cached_skipped.add(emoji)
+                cache_dirty = True
+                if progress_callback is not None:
+                    fraction = progress_start + ((progress_end - progress_start) * (index / total_emojis))
+                    progress_callback(fraction, f"Preparation palette Twemoji {index}/{total_emojis}")
+                continue
+            raise
         tile_array = np.asarray(tile, dtype=np.uint8)
         mean_rgb, brightness, saturation, coverage = compute_cell_average(tile_array)
         entries.append(
@@ -1130,6 +1474,27 @@ def build_palette_entries(
                 alpha_coverage=coverage,
             )
         )
+        cached_entries[emoji] = {
+            "mean_rgb": [float(value) for value in mean_rgb.tolist()],
+            "brightness": float(brightness),
+            "saturation": float(saturation),
+            "alpha_coverage": float(coverage),
+        }
+        cache_dirty = True
+        if progress_callback is not None:
+            fraction = progress_start + ((progress_end - progress_start) * (index / total_emojis))
+            progress_callback(fraction, f"Preparation palette {index}/{total_emojis}")
+    if not entries:
+        if render_source.kind == "twemoji":
+            fail(
+                "No usable Twemoji assets were available for the current palette. "
+                "Try banning fewer emojis, using a custom palette, or switching emoji source."
+            )
+        fail("Palette is empty. Provide at least one emoji.")
+    if cache_dirty:
+        cache_payload["entries"] = cached_entries
+        cache_payload["skipped"] = sorted(cached_skipped)
+        save_palette_metrics_cache(render_source, emoji_size, cache_payload)
     return entries
 
 
@@ -1241,6 +1606,8 @@ def render_emoji_canvas(
     emoji_size: int,
     render_source: EmojiRenderSource,
     background: Tuple[int, int, int, int],
+    progress_callback: ProgressCallback | None = None,
+    progress_range: Tuple[float, float] = (0.0, 1.0),
 ) -> Image.Image:
     rows = len(emoji_grid)
     columns = len(emoji_grid[0]) if rows else 0
@@ -1252,15 +1619,26 @@ def render_emoji_canvas(
 
     # Cache pre-rendered emoji tiles so repeated emojis are pasted instead of redrawn.
     tile_cache: dict[str, Image.Image] = {}
+    total_cells = max(1, rows * columns)
+    processed_cells = 0
+    progress_start, progress_end = progress_range
 
     for y, row in enumerate(emoji_grid):
         for x, emoji in enumerate(row):
             if emoji is None:
+                processed_cells += 1
+                if progress_callback is not None and (processed_cells == total_cells or processed_cells % max(1, total_cells // 40) == 0):
+                    fraction = progress_start + ((progress_end - progress_start) * (processed_cells / total_cells))
+                    progress_callback(fraction, f"Dessin emojis {processed_cells}/{total_cells}")
                 continue
             if emoji not in tile_cache:
                 tile_cache[emoji] = render_single_emoji_tile(emoji, emoji_size, render_source)
             tile = tile_cache[emoji]
             canvas.alpha_composite(tile, (x * emoji_size, y * emoji_size))
+            processed_cells += 1
+            if progress_callback is not None and (processed_cells == total_cells or processed_cells % max(1, total_cells // 40) == 0):
+                fraction = progress_start + ((progress_end - progress_start) * (processed_cells / total_cells))
+                progress_callback(fraction, f"Dessin emojis {processed_cells}/{total_cells}")
 
     return canvas
 
@@ -1299,7 +1677,6 @@ def prepare_render(args: argparse.Namespace) -> tuple[Image.Image, Tuple[int, in
 
     image = load_image(args.input)
     background = parse_background(args.background)
-    palette = parse_palette(args.palette)
 
     columns, rows = compute_grid_size(
         width=image.width,
@@ -1311,22 +1688,46 @@ def prepare_render(args: argparse.Namespace) -> tuple[Image.Image, Tuple[int, in
     )
 
     render_source = resolve_render_source(args.font, args.emoji_size, args.emoji_source)
+    palette = parse_palette(
+        args.palette,
+        args.banned_palette,
+        default_palette=build_default_palette_for_render_source(render_source.kind),
+    )
     return image, background, palette, columns, rows, render_source
 
 
-def run_with_args(args: argparse.Namespace) -> RenderResult:
+def run_with_args(args: argparse.Namespace, progress_callback: ProgressCallback | None = None) -> RenderResult:
     image, background, palette, columns, rows, render_source = prepare_render(args)
     started_at = time.perf_counter()
     sampled_image = resize_for_grid(image, columns, rows)
-    palette_entries = build_palette_entries(palette, args.emoji_size, render_source)
+    if progress_callback is not None:
+        progress_callback(0.02, "Chargement image")
+    palette_entries = build_palette_entries(
+        palette,
+        args.emoji_size,
+        render_source,
+        progress_callback=progress_callback,
+        progress_range=(0.05, 0.55),
+    )
+    if progress_callback is not None:
+        progress_callback(0.62, "Analyse image")
     emoji_grid = build_emoji_grid(sampled_image, palette_entries, args.alpha_threshold)
-    canvas = render_emoji_canvas(emoji_grid, args.emoji_size, render_source, background)
+    canvas = render_emoji_canvas(
+        emoji_grid,
+        args.emoji_size,
+        render_source,
+        background,
+        progress_callback=progress_callback,
+        progress_range=(0.68, 0.97),
+    )
 
     output_path = Path(args.output)
     try:
         canvas.save(output_path, format="PNG")
     except OSError as exc:
         fail(f"Could not save output image '{output_path}': {exc}")
+    if progress_callback is not None:
+        progress_callback(1.0, "Image terminee")
     duration_seconds = time.perf_counter() - started_at
     total_cells = columns * rows
     filled_cells = sum(1 for row in emoji_grid for emoji in row if emoji is not None)
@@ -1355,6 +1756,7 @@ def build_gui_args(values: dict[str, str | bool]) -> argparse.Namespace:
         return float(value)
 
     palette_value = str(values["palette"]).strip()
+    banned_palette_value = str(values["banned_palette"]).strip()
     font_value = str(values["font"]).strip()
 
     return argparse.Namespace(
@@ -1367,6 +1769,7 @@ def build_gui_args(values: dict[str, str | bool]) -> argparse.Namespace:
         emoji_size=int(str(values["emoji_size"]).strip()),
         scale=parse_float("scale"),
         palette=palette_value or None,
+        banned_palette=banned_palette_value or None,
         background=str(values["background"]).strip(),
         font=font_value or None,
         emoji_source=str(values["emoji_source"]).strip(),
@@ -1461,6 +1864,7 @@ def launch_gui() -> None:
         "emoji_size": tk.StringVar(value="20"),
         "scale": tk.StringVar(value="1.0"),
         "palette": tk.StringVar(),
+        "banned_palette": tk.StringVar(),
         "background": tk.StringVar(value="transparent"),
         "font": tk.StringVar(),
         "emoji_source": tk.StringVar(value="auto"),
@@ -1475,6 +1879,16 @@ def launch_gui() -> None:
     estimate_var = tk.StringVar(value="Estimation : n/a")
     is_running = {"value": False}
     current_mode = {"value": "image_to_image"}
+    recent_banned_emojis: List[str] = []
+    browser_state: dict[str, object] = {
+        "window": None,
+        "search_var": None,
+        "selected_info_var": None,
+        "visible_banned_limit": INITIAL_BROWSER_RESULTS,
+        "visible_available_limit": INITIAL_BROWSER_RESULTS,
+    }
+    browser_catalog = {"emojis": []}
+    restoring_settings = {"value": False}
 
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
@@ -1555,6 +1969,7 @@ def launch_gui() -> None:
         description: str,
         key: str,
         browse: str | None = None,
+        button_text: str = "Parcourir",
         width: int = 18,
         stretch: bool = False,
     ) -> ttk.Entry:
@@ -1583,38 +1998,44 @@ def launch_gui() -> None:
         if browse == "open":
             ttk.Button(
                 control_frame,
-                text="Parcourir",
+                text=button_text,
                 command=lambda: choose_input_file(),
             ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "video_input":
             ttk.Button(
                 control_frame,
-                text="Parcourir",
+                text=button_text,
                 command=lambda: choose_video_input_file(),
             ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "save":
             ttk.Button(
                 control_frame,
-                text="Parcourir",
+                text=button_text,
                 command=lambda: choose_output_file(),
             ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "mp4_save":
             ttk.Button(
                 control_frame,
-                text="Parcourir",
+                text=button_text,
                 command=lambda: choose_video_to_video_output_file(),
             ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "font":
             ttk.Button(
                 control_frame,
-                text="Parcourir",
+                text=button_text,
                 command=lambda: choose_font_file(),
             ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "video":
             ttk.Button(
                 control_frame,
-                text="Parcourir",
+                text=button_text,
                 command=lambda: choose_video_file(),
+            ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        elif browse == "banned_browser":
+            ttk.Button(
+                control_frame,
+                text=button_text,
+                command=lambda: open_banned_emoji_browser(),
             ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         return entry
 
@@ -1715,24 +2136,344 @@ def launch_gui() -> None:
         "Liste d'emojis séparés par des virgules, ou chemin vers un fichier texte.",
         "palette", width=34,
     )
+    def save_current_gui_settings(*_args: object) -> None:
+        if restoring_settings["value"]:
+            return
+        settings = {
+            "columns": field_vars["columns"].get(),
+            "rows": field_vars["rows"].get(),
+            "emoji_size": field_vars["emoji_size"].get(),
+            "scale": field_vars["scale"].get(),
+            "palette": field_vars["palette"].get(),
+            "banned_palette": field_vars["banned_palette"].get(),
+            "background": field_vars["background"].get(),
+            "emoji_source": field_vars["emoji_source"].get(),
+            "alpha_threshold": field_vars["alpha_threshold"].get(),
+            "video_fps": field_vars["video_fps"].get(),
+            "video_start_columns": field_vars["video_start_columns"].get(),
+            "video_max_columns": field_vars["video_max_columns"].get(),
+            "video_step_columns": field_vars["video_step_columns"].get(),
+            "stretch": stretch_var.get(),
+            "recent_banned_emojis": recent_banned_emojis,
+        }
+        save_gui_settings(settings)
+
+    def restore_gui_settings() -> None:
+        settings = load_gui_settings()
+        if not settings:
+            field_vars["banned_palette"].set(encode_emoji_list(DEFAULT_BANNED_EMOJIS))
+            recent_banned_emojis[:] = list(DEFAULT_BANNED_EMOJIS)
+            return
+        restoring_settings["value"] = True
+        try:
+            for key in (
+                "columns",
+                "rows",
+                "emoji_size",
+                "scale",
+                "palette",
+                "banned_palette",
+                "background",
+                "emoji_source",
+                "alpha_threshold",
+                "video_fps",
+                "video_start_columns",
+                "video_max_columns",
+                "video_step_columns",
+            ):
+                value = settings.get(key)
+                if isinstance(value, str):
+                    field_vars[key].set(value)
+            if not field_vars["banned_palette"].get().strip():
+                field_vars["banned_palette"].set(encode_emoji_list(DEFAULT_BANNED_EMOJIS))
+            stretch_value = settings.get("stretch")
+            if isinstance(stretch_value, bool):
+                stretch_var.set(stretch_value)
+            saved_recent = settings.get("recent_banned_emojis")
+            if isinstance(saved_recent, list):
+                recent_banned_emojis[:] = [str(item) for item in saved_recent if isinstance(item, str)]
+            else:
+                recent_banned_emojis[:] = list(DEFAULT_BANNED_EMOJIS)
+        finally:
+            restoring_settings["value"] = False
+
+    def get_banned_emojis() -> List[str]:
+        raw_value = field_vars["banned_palette"].get().strip()
+        return parse_emoji_list(raw_value or None, default=DEFAULT_BANNED_EMOJIS)
+
+    def set_banned_emojis(emojis: Sequence[str]) -> None:
+        field_vars["banned_palette"].set(encode_emoji_list(parse_emoji_list(encode_emoji_list(emojis))))
+
+    def touch_recent_emoji(emoji: str) -> None:
+        if emoji in recent_banned_emojis:
+            recent_banned_emojis.remove(emoji)
+        recent_banned_emojis.insert(0, emoji)
+        del recent_banned_emojis[16:]
+
+    def build_browser_candidates() -> List[str]:
+        palette_value = field_vars["palette"].get().strip()
+        custom_palette = parse_emoji_list(palette_value or None, default=SQUARE_FIRST_DEFAULT_PALETTE)
+        banned = get_banned_emojis()
+        catalog = browser_catalog["emojis"] if isinstance(browser_catalog.get("emojis"), list) else []
+        ordered: List[str] = []
+        seen: set[str] = set()
+        for emoji in recent_banned_emojis + banned + custom_palette + list(DEFAULT_BANNED_EMOJIS) + list(SQUARE_FIRST_DEFAULT_PALETTE) + list(catalog):
+            if emoji and emoji not in seen:
+                ordered.append(emoji)
+                seen.add(emoji)
+        return ordered
+
+    def get_browser_photo_image(
+        emoji: str,
+        image_cache: dict[str, ImageTk.PhotoImage | None],
+        tile_size: int = 36,
+    ) -> ImageTk.PhotoImage | None:
+        if ImageTk is None:
+            return None
+        if emoji in image_cache:
+            return image_cache[emoji]
+        try:
+            tile = fetch_twemoji_tile(emoji, tile_size)
+        except EmojiMakerError:
+            image_cache[emoji] = None
+            return None
+        image_cache[emoji] = ImageTk.PhotoImage(tile)
+        return image_cache[emoji]
+
+    def open_banned_emoji_browser() -> None:
+        existing_window = browser_state.get("window")
+        if isinstance(existing_window, tk.Toplevel) and existing_window.winfo_exists():
+            existing_window.deiconify()
+            existing_window.lift()
+            existing_window.focus_force()
+            return
+
+        if not browser_catalog["emojis"]:
+            try:
+                browser_catalog["emojis"] = get_twemoji_browser_catalog()
+            except EmojiMakerError as exc:
+                messagebox.showerror("Catalogue Twemoji", str(exc))
+                return
+
+        browser_window = tk.Toplevel(root)
+        browser_window.title("Emojis bannis")
+        browser_window.geometry("860x640")
+        browser_window.minsize(720, 480)
+        browser_window.configure(bg="#f3f6fb")
+        browser_window.transient(root)
+        browser_window.columnconfigure(0, weight=1)
+        browser_window.rowconfigure(1, weight=1)
+        browser_state["window"] = browser_window
+        browser_state["search_var"] = tk.StringVar()
+        browser_state["selected_info_var"] = tk.StringVar(
+            value="Clique sur un emoji pour l'ajouter aux bannis ou le retirer."
+        )
+        browser_state["visible_banned_limit"] = INITIAL_BROWSER_RESULTS
+        browser_state["visible_available_limit"] = INITIAL_BROWSER_RESULTS
+
+        image_cache: dict[str, ImageTk.PhotoImage | None] = {}
+
+        header_frame = ttk.Frame(browser_window, padding=16, style="App.TFrame")
+        header_frame.grid(row=0, column=0, sticky="ew")
+        header_frame.columnconfigure(1, weight=1)
+        ttk.Label(header_frame, text="Emojis bannis", style="Hero.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(header_frame, textvariable=browser_state["search_var"], width=28).grid(row=0, column=1, sticky="e")
+        ttk.Label(
+            header_frame,
+            text="Recherche par emoji, nom Unicode, ou codepoint. Les plus recents restent en haut.",
+            style="Muted.TLabel",
+            wraplength=780,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        content_frame = ttk.Frame(browser_window, style="App.TFrame")
+        content_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        content_frame.columnconfigure(0, weight=1)
+        content_frame.rowconfigure(0, weight=1)
+
+        browser_canvas = tk.Canvas(content_frame, background="#f3f6fb", highlightthickness=0, bd=0)
+        browser_canvas.grid(row=0, column=0, sticky="nsew")
+        browser_scrollbar = ttk.Scrollbar(content_frame, orient="vertical", command=browser_canvas.yview)
+        browser_scrollbar.grid(row=0, column=1, sticky="ns")
+        browser_canvas.configure(yscrollcommand=browser_scrollbar.set)
+
+        tiles_frame = ttk.Frame(browser_canvas, style="App.TFrame")
+        tiles_frame.columnconfigure(0, weight=1)
+        browser_canvas_window = browser_canvas.create_window((0, 0), window=tiles_frame, anchor="nw")
+
+        def update_browser_scroll_region(_event: object | None = None) -> None:
+            browser_canvas.configure(scrollregion=browser_canvas.bbox("all"))
+
+        def update_browser_canvas_width(event: object) -> None:
+            width = getattr(event, "width", None)
+            if width is not None:
+                browser_canvas.itemconfigure(browser_canvas_window, width=width)
+
+        tiles_frame.bind("<Configure>", update_browser_scroll_region)
+        browser_canvas.bind("<Configure>", update_browser_canvas_width)
+
+        footer_frame = ttk.Frame(browser_window, padding=(16, 0, 16, 16), style="App.TFrame")
+        footer_frame.grid(row=2, column=0, sticky="ew")
+        footer_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            footer_frame,
+            textvariable=browser_state["selected_info_var"],
+            wraplength=780,
+            justify="left",
+            style="Status.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+
+        def update_banned_field_and_recent(emoji: str, should_ban: bool) -> None:
+            current_banned = get_banned_emojis()
+            if should_ban and emoji not in current_banned:
+                current_banned.append(emoji)
+            elif not should_ban:
+                current_banned = [item for item in current_banned if item != emoji]
+            set_banned_emojis(current_banned)
+            touch_recent_emoji(emoji)
+
+        def render_browser(*_args: object) -> None:
+            for child in tiles_frame.winfo_children():
+                child.destroy()
+
+            raw_search = str(browser_state["search_var"].get()).strip().lower()
+            search_text = raw_search.replace("u+", "").replace("-", "").replace(" ", "")
+            banned_emojis = get_banned_emojis()
+            candidate_emojis = build_browser_candidates()
+            candidate_order = {emoji: index for index, emoji in enumerate(candidate_emojis)}
+
+            def emoji_matches(emoji: str) -> bool:
+                if not raw_search:
+                    return True
+                codepoints = "".join(f"{ord(char):x}" for char in emoji if ord(char) != 0xFE0F)
+                name = describe_emoji(emoji).lower()
+                return (
+                    raw_search in emoji.lower()
+                    or raw_search in name
+                    or search_text in codepoints
+                )
+
+            def ordered_subset(emojis: Sequence[str]) -> List[str]:
+                recent_order = {emoji: index for index, emoji in enumerate(recent_banned_emojis)}
+                return sorted(
+                    [emoji for emoji in emojis if emoji_matches(emoji)],
+                    key=lambda emoji: (recent_order.get(emoji, 9999), candidate_order.get(emoji, 9999)),
+                )
+            all_visible_banned = ordered_subset(banned_emojis)
+            all_visible_available = ordered_subset([emoji for emoji in candidate_emojis if emoji not in banned_emojis])
+            banned_limit = int(browser_state.get("visible_banned_limit", INITIAL_BROWSER_RESULTS))
+            available_limit = int(browser_state.get("visible_available_limit", INITIAL_BROWSER_RESULTS))
+            visible_banned = all_visible_banned[:banned_limit]
+            visible_available = all_visible_available[:available_limit]
+            sections = [
+                ("Bannis", visible_banned, all_visible_banned, False, "visible_banned_limit"),
+                ("Twemoji disponibles", visible_available, all_visible_available, True, "visible_available_limit"),
+            ]
+
+            row = 0
+            visible_count = 0
+            for title, emojis, full_matches, should_ban, limit_key in sections:
+                section = ttk.LabelFrame(tiles_frame, text=title, padding=12, style="Section.TLabelframe")
+                section.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+                for column in range(4):
+                    section.columnconfigure(column, weight=1)
+                row += 1
+
+                tile_index = 0
+                for emoji in emojis:
+                    photo = get_browser_photo_image(emoji, image_cache)
+                    if photo is None:
+                        continue
+                    visible_count += 1
+                    card = ttk.Frame(section, style="Card.TFrame", padding=6)
+                    card.grid(row=tile_index // 4, column=tile_index % 4, sticky="nsew", padx=6, pady=6)
+                    button = ttk.Button(
+                        card,
+                        image=photo,
+                        text=f"{emoji}\n{describe_emoji(emoji)}",
+                        compound="top",
+                        width=18,
+                        command=lambda emoji=emoji, should_ban=should_ban: on_browser_emoji_click(emoji, should_ban),
+                    )
+                    button.image = photo
+                    button.grid(row=0, column=0, sticky="nsew")
+                    tile_index += 1
+
+                if tile_index == 0:
+                    ttk.Label(
+                        section,
+                        text="Aucun asset Twemoji disponible pour cette section.",
+                        style="Muted.TLabel",
+                        wraplength=720,
+                        justify="left",
+                    ).grid(row=0, column=0, sticky="w")
+                elif len(full_matches) > len(emojis):
+                    remaining = len(full_matches) - len(emojis)
+                    ttk.Button(
+                        section,
+                        text=f"Charger plus ({remaining} restant)",
+                        command=lambda limit_key=limit_key: on_load_more(limit_key),
+                    ).grid(row=(tile_index // 4) + 1, column=0, sticky="w", padx=6, pady=(8, 0))
+
+            if visible_count == 0:
+                browser_state["selected_info_var"].set(
+                    "Aucun emoji Twemoji visible avec ce filtre. Essaie un autre nom ou codepoint."
+                )
+            else:
+                browser_state["selected_info_var"].set(
+                    f"{len(all_visible_banned)} banni(s) trouves | {len(all_visible_available)} emoji(s) Twemoji trouves. "
+                    f"Affichage progressif pour ouvrir la fenetre plus vite."
+                )
+
+        def on_browser_emoji_click(emoji: str, should_ban: bool) -> None:
+            update_banned_field_and_recent(emoji, should_ban)
+            action = "ajoute aux bannis" if should_ban else "retire des bannis"
+            browser_state["selected_info_var"].set(f"{emoji} {action} | {describe_emoji(emoji)}")
+            render_browser()
+
+        def on_load_more(limit_key: str) -> None:
+            current_limit = int(browser_state.get(limit_key, INITIAL_BROWSER_RESULTS))
+            browser_state[limit_key] = current_limit + LOAD_MORE_BROWSER_RESULTS
+            render_browser()
+
+        def close_browser() -> None:
+            browser_state["window"] = None
+            browser_state["search_var"] = None
+            browser_state["selected_info_var"] = None
+            browser_window.destroy()
+
+        browser_window.protocol("WM_DELETE_WINDOW", close_browser)
+        def on_search_change(*_args: object) -> None:
+            browser_state["visible_banned_limit"] = INITIAL_BROWSER_RESULTS
+            browser_state["visible_available_limit"] = INITIAL_BROWSER_RESULTS
+            render_browser()
+
+        browser_state["search_var"].trace_add("write", on_search_change)
+        render_browser()
+
     add_row(
-        shared_frame, 6, "Fond",
+        shared_frame, 6, "Emojis bannis",
+        "Liste d'emojis Ã  exclure de la palette finale, ou chemin vers un fichier texte.",
+        "banned_palette", browse="banned_browser", button_text="Voir", width=34,
+    )
+    add_row(
+        shared_frame, 7, "Fond",
         "Couleur des zones vides : `transparent`, `white`, `#112233`, etc.",
         "background", width=16,
     )
     add_row(
-        shared_frame, 7, "Police emoji",
+        shared_frame, 8, "Police emoji",
         "Optionnel. À renseigner si l'auto-détection ne trouve pas de bonne police.",
         "font", browse="font", width=34,
     )
     add_row(
-        shared_frame, 8, "Seuil alpha",
+        shared_frame, 9, "Seuil alpha",
         "Ignore les zones presque transparentes. 0.05 est une bonne base.",
         "alpha_threshold", width=10,
     )
 
     source_row = ttk.Frame(shared_frame, style="Card.TFrame")
-    source_row.grid(row=9, column=0, sticky="ew", pady=5)
+    source_row.grid(row=10, column=0, sticky="ew", pady=5)
     source_row.columnconfigure(0, weight=1)
     source_text = ttk.Frame(source_row, style="Card.TFrame")
     source_text.grid(row=0, column=0, sticky="ew", padx=(0, 18))
@@ -1755,7 +2496,7 @@ def launch_gui() -> None:
     source_combo.grid(row=0, column=1, sticky="e")
 
     stretch_row = ttk.Frame(shared_frame, style="Card.TFrame")
-    stretch_row.grid(row=10, column=0, sticky="ew", pady=(8, 4))
+    stretch_row.grid(row=11, column=0, sticky="ew", pady=(8, 4))
     stretch_row.columnconfigure(0, weight=1)
     ttk.Checkbutton(
         stretch_row,
@@ -1775,7 +2516,7 @@ def launch_gui() -> None:
         "Tu règles la matière commune une fois, puis tu choisis seulement la sortie dans l'onglet voulu."
     )
     ttk.Label(shared_frame, text=help_text, wraplength=860, justify="left").grid(
-        row=11, column=0, sticky="w", pady=(8, 0)
+        row=12, column=0, sticky="w", pady=(8, 0)
     )
 
     notebook = ttk.Notebook(main_frame)
@@ -1924,6 +2665,7 @@ def launch_gui() -> None:
             "emoji_size": field_vars["emoji_size"].get(),
             "scale": field_vars["scale"].get(),
             "palette": field_vars["palette"].get(),
+            "banned_palette": field_vars["banned_palette"].get(),
             "background": field_vars["background"].get(),
             "font": field_vars["font"].get(),
             "emoji_source": field_vars["emoji_source"].get(),
@@ -1985,6 +2727,13 @@ def launch_gui() -> None:
         except Exception:
             estimate_var.set("Estimation : paramètres incomplets ou invalides.")
 
+    def make_progress_reporter(prefix: str) -> ProgressCallback:
+        def report(progress: float, detail: str) -> None:
+            bounded = max(0.0, min(1.0, progress))
+            percent = int(round(bounded * 100))
+            root.after(0, lambda: status_var.set(f"{prefix} {percent}% | {detail}"))
+        return report
+
     def on_render() -> None:
         if is_running["value"]:
             return
@@ -2020,7 +2769,7 @@ def launch_gui() -> None:
 
         def worker() -> None:
             try:
-                result = run_with_args(args)
+                result = run_with_args(args, progress_callback=make_progress_reporter("Rendu"))
             except EmojiMakerError as exc:
                 root.after(0, lambda exc=exc: on_error(str(exc)))
                 return
@@ -2101,6 +2850,7 @@ def launch_gui() -> None:
                     video_start_columns=args.video_start_columns,
                     video_max_columns=args.video_max_columns,
                     video_step_columns=args.video_step_columns,
+                    progress_callback=make_progress_reporter("Video"),
                 )
             except EmojiMakerError as exc:
                 root.after(0, lambda exc=exc: on_error(str(exc)))
@@ -2171,6 +2921,7 @@ def launch_gui() -> None:
                     args=args,
                     video_input=args.video_to_video_input,
                     video_output=args.video_to_video_output,
+                    progress_callback=make_progress_reporter("Video -> video"),
                 )
             except EmojiMakerError as exc:
                 root.after(0, lambda exc=exc: on_error(str(exc)))
@@ -2201,11 +2952,22 @@ def launch_gui() -> None:
             f"Taille vidéo : {result.canvas_width}x{result.canvas_height}",
         )
 
-    for variable in field_vars.values():
+    restore_gui_settings()
+
+    for key, variable in field_vars.items():
         variable.trace_add("write", refresh_estimate)
+        if key not in {"input", "output", "video_output", "video_to_video_input", "video_to_video_output", "font"}:
+            variable.trace_add("write", save_current_gui_settings)
     stretch_var.trace_add("write", refresh_estimate)
+    stretch_var.trace_add("write", save_current_gui_settings)
     notebook.bind("<<NotebookTabChanged>>", refresh_estimate)
     refresh_estimate()
+
+    def on_close() -> None:
+        save_current_gui_settings()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
 
     root.mainloop()
 
