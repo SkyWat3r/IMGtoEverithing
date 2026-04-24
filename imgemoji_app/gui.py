@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Callable, List, Sequence, Tuple
 
 import numpy as np
-from PIL import Image, ImageColor, ImageDraw, ImageFont
+from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps
 
 try:
     from PIL import ImageTk
@@ -51,6 +51,7 @@ from .cache import (
     save_palette_metrics_cache,
     save_render_history,
 )
+from .ascii_art import compute_ascii_rows, find_monospace_font, measure_glyph_cell, run_ascii_with_args
 from .common import build_mp4_encode_command, format_duration, has_ffmpeg, has_ffprobe
 from .constants import (
     COMMON_EMOJI_FONT_FAMILIES,
@@ -1426,6 +1427,13 @@ def build_gui_args(values: dict[str, str | bool]) -> argparse.Namespace:
     return argparse.Namespace(
         input=str(values["input"]).strip(),
         output=str(values["output"]).strip(),
+        ascii_output=str(values["ascii_output"]).strip() or None,
+        ascii_text_output=str(values["ascii_text_output"]).strip() or None,
+        ascii_charset=str(values["ascii_charset"]).strip(),
+        ascii_font=str(values["ascii_font"]).strip() or None,
+        ascii_font_size=int(str(values["ascii_font_size"]).strip()),
+        ascii_color=bool(values["ascii_color"]),
+        ascii_invert=bool(values["ascii_invert"]),
         video_to_video_input=str(values["video_to_video_input"]).strip() or None,
         video_to_video_output=str(values["video_to_video_output"]).strip() or None,
         columns=parse_optional_int("columns"),
@@ -1486,6 +1494,127 @@ def estimate_video_for_args(args: argparse.Namespace) -> tuple[float, int]:
     return total_seconds, len(frame_columns)
 
 
+def estimate_ascii_for_args(args: argparse.Namespace) -> tuple[float, dict[str, int | str]]:
+    image = load_image(args.input)
+    columns = args.columns if args.columns is not None else 120
+    font_size = getattr(args, "font_size", getattr(args, "ascii_font_size", 12))
+    ascii_font = getattr(args, "font", getattr(args, "ascii_font", None))
+    font = find_monospace_font(ascii_font, int(font_size))
+    cell_width, cell_height = measure_glyph_cell(font)
+    rows = compute_ascii_rows(image.width, image.height, columns, args.rows, args.scale, cell_width, cell_height)
+    total_cells = columns * rows
+    estimated_seconds = 0.15 + (total_cells * 0.00003)
+    return estimated_seconds, {
+        "columns": columns,
+        "rows": rows,
+        "total_cells": total_cells,
+        "output_kind": Path(args.ascii_output or "").suffix.lower() or ".png",
+    }
+
+
+RECENT_MEDIA_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".mp4"}
+RESULT_ROOT_DIR = Path.cwd() / "result"
+RESULT_SUBDIRS = {
+    "image_to_image": RESULT_ROOT_DIR / "IMGemoji",
+    "image_to_ascii": RESULT_ROOT_DIR / "ASCII",
+    "image_to_video": RESULT_ROOT_DIR / "IMGvideo",
+    "video_to_video": RESULT_ROOT_DIR / "VIDEOemoji",
+}
+
+
+def make_unique_output_path(path_value: str | None) -> str | None:
+    if path_value is None:
+        return None
+    raw_value = str(path_value).strip()
+    if not raw_value:
+        return None
+    output_path = Path(raw_value)
+    if not output_path.exists():
+        return str(output_path)
+    stem = output_path.stem
+    suffix = output_path.suffix
+    parent = output_path.parent
+    counter = 2
+    while True:
+        candidate = parent / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return str(candidate)
+        counter += 1
+
+
+def build_default_output_path(input_path: Path, suffix: str, extension: str) -> str:
+    if extension == ".txt":
+        output_dir = RESULT_SUBDIRS["image_to_ascii"]
+    elif extension == ".mp4":
+        output_dir = RESULT_SUBDIRS["video_to_video"] if suffix == "emoji" else RESULT_SUBDIRS["image_to_video"]
+    elif suffix == "ascii":
+        output_dir = RESULT_SUBDIRS["image_to_ascii"]
+    elif suffix == "progress":
+        output_dir = RESULT_SUBDIRS["image_to_video"]
+    else:
+        output_dir = RESULT_SUBDIRS["image_to_image"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return str(output_dir / f"{input_path.stem}_{suffix}{extension}")
+
+
+def is_default_output_value(value: str, mode: str) -> bool:
+    raw_value = value.strip()
+    if not raw_value:
+        return True
+    path = Path(raw_value)
+    expected_dir = RESULT_SUBDIRS[mode]
+    default_names = {
+        "image_to_image": "result.png",
+        "image_to_ascii": "result_ascii.png",
+        "image_to_video": "result_progress.gif",
+        "video_to_video": "result_video_emoji.mp4",
+    }
+    return path == expected_dir / default_names[mode] or path.name == default_names[mode]
+
+
+def discover_recent_media(limit: int = 10) -> list[Path]:
+    search_root = RESULT_ROOT_DIR
+    search_root.mkdir(parents=True, exist_ok=True)
+    seen: set[Path] = set()
+    candidates: list[Path] = []
+    for candidate in search_root.rglob("*"):
+        if not candidate.is_file():
+            continue
+        if candidate.suffix.lower() not in RECENT_MEDIA_SUFFIXES:
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        candidates.append(candidate)
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return candidates[:limit]
+
+
+def build_recent_thumbnail(path: Path, size: tuple[int, int] = (160, 112)) -> Image.Image:
+    frame = Image.new("RGBA", size, "#141926")
+    draw = ImageDraw.Draw(frame)
+    inner_box = (8, 8, size[0] - 8, size[1] - 8)
+    draw.rounded_rectangle(inner_box, radius=14, fill="#1b2333", outline="#2b3750", width=1)
+
+    if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}:
+        try:
+            with Image.open(path) as source:
+                preview = source.convert("RGBA")
+                preview.thumbnail((size[0] - 16, size[1] - 16), Image.Resampling.LANCZOS)
+                framed = ImageOps.pad(preview, (size[0] - 16, size[1] - 16), method=Image.Resampling.LANCZOS, color="#141926")
+                frame.alpha_composite(framed, (8, 8))
+                return frame
+        except (OSError, Image.DecompressionBombError):
+            label = f"{path.stem[:16]}\nAperçu désactivé\nImage trop grande"
+            draw.multiline_text((18, 20), label, fill="#8ca0c8", spacing=8)
+            return frame
+
+    ext_label = path.suffix.upper().replace(".", "") or "FILE"
+    label = f"{ext_label}\n{path.stem[:18]}\nAperçu indisponible"
+    draw.multiline_text((18, 20), label, fill="#8ca0c8", spacing=8)
+    return frame
+
+
 def launch_gui() -> None:
     if tk is None or filedialog is None or messagebox is None or ttk is None:
         fail(
@@ -1495,34 +1624,65 @@ def launch_gui() -> None:
 
     root = tk.Tk()
     root.title("imgEMOJI")
-    root.geometry("980x700")
-    root.minsize(820, 560)
+    root.geometry("1380x860")
+    root.minsize(1160, 720)
 
     style = ttk.Style(root)
     try:
         style.theme_use("clam")
     except tk.TclError:
         pass
-    root.configure(bg="#f3f6fb")
-    style.configure("App.TFrame", background="#f3f6fb")
-    style.configure("Hero.TLabel", background="#f3f6fb", font=("TkDefaultFont", 18, "bold"))
-    style.configure("Muted.TLabel", background="#f3f6fb", foreground="#516074")
-    style.configure("Section.TLabelframe", background="#ffffff")
-    style.configure("Section.TLabelframe.Label", background="#ffffff", font=("TkDefaultFont", 10, "bold"))
-    style.configure("Card.TFrame", background="#ffffff")
-    style.configure("FieldTitle.TLabel", background="#ffffff", font=("TkDefaultFont", 10, "bold"))
-    style.configure("FieldHelp.TLabel", background="#ffffff", foreground="#5b6576")
-    style.configure("Info.TLabel", background="#ffffff", foreground="#435066")
-    style.configure("Status.TLabel", background="#f3f6fb", foreground="#243041")
-    style.configure("TNotebook", background="#f3f6fb", borderwidth=0)
-    style.configure("TNotebook.Tab", padding=(16, 10), font=("TkDefaultFont", 10, "bold"))
+    shell_bg = "#0b1020"
+    panel_bg = "#11182b"
+    card_bg = "#172033"
+    accent = "#4fb3ff"
+    text_primary = "#f4f7ff"
+    text_muted = "#8ea2c8"
+    border = "#24324d"
+
+    root.configure(bg=shell_bg)
+    style.configure("App.TFrame", background=shell_bg)
+    style.configure("Sidebar.TFrame", background=panel_bg)
+    style.configure("Panel.TFrame", background=panel_bg)
+    style.configure("Card.TFrame", background=card_bg)
+    style.configure("Hero.TLabel", background=shell_bg, foreground=text_primary, font=("TkDefaultFont", 20, "bold"))
+    style.configure("Title.TLabel", background=panel_bg, foreground=text_primary, font=("TkDefaultFont", 15, "bold"))
+    style.configure("SectionTitle.TLabel", background=card_bg, foreground=text_primary, font=("TkDefaultFont", 11, "bold"))
+    style.configure("Muted.TLabel", background=shell_bg, foreground=text_muted)
+    style.configure("SidebarMuted.TLabel", background=panel_bg, foreground=text_muted)
+    style.configure("FieldTitle.TLabel", background=card_bg, foreground=text_primary, font=("TkDefaultFont", 10, "bold"))
+    style.configure("FieldHelp.TLabel", background=card_bg, foreground=text_muted)
+    style.configure("Info.TLabel", background=card_bg, foreground=text_muted)
+    style.configure("Status.TLabel", background=shell_bg, foreground=text_primary)
+    style.configure("Section.TLabelframe", background=card_bg, bordercolor=border, relief="solid")
+    style.configure("Section.TLabelframe.Label", background=card_bg, foreground=text_primary, font=("TkDefaultFont", 10, "bold"))
+    style.configure("TNotebook", background=shell_bg, borderwidth=0)
+    style.configure("TNotebook.Tab", background=panel_bg, foreground=text_muted, padding=(18, 12), font=("TkDefaultFont", 10, "bold"))
+    style.map("TNotebook.Tab", background=[("selected", card_bg)], foreground=[("selected", text_primary)])
+    style.configure("Dark.Horizontal.TProgressbar", troughcolor="#0f1526", background=accent, bordercolor=border, lightcolor=accent, darkcolor=accent)
+    style.configure("Dark.TCheckbutton", background=card_bg, foreground=text_primary)
+    style.map("Dark.TCheckbutton", background=[("active", card_bg)], foreground=[("disabled", "#60708f")])
+    style.configure("Dark.TCombobox", fieldbackground="#0f1526", background=card_bg, foreground=text_primary, arrowcolor=text_primary)
+    style.configure("Dark.TEntry", fieldbackground="#0f1526", background=card_bg, foreground=text_primary, insertcolor=text_primary)
+    style.configure("Dark.Vertical.TScrollbar", background=card_bg, troughcolor=shell_bg, bordercolor=border, arrowcolor=text_muted)
+    root.option_add("*TCombobox*Listbox*Background", "#0f1526")
+    root.option_add("*TCombobox*Listbox*Foreground", text_primary)
+    root.option_add("*TCombobox*Listbox*selectBackground", accent)
+    root.option_add("*TCombobox*Listbox*selectForeground", "#09101d")
+    for output_dir in RESULT_SUBDIRS.values():
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     field_vars = {
         "input": tk.StringVar(),
-        "output": tk.StringVar(value="result.png"),
-        "video_output": tk.StringVar(value="result_progress.gif"),
+        "output": tk.StringVar(value=str(RESULT_SUBDIRS["image_to_image"] / "result.png")),
+        "ascii_output": tk.StringVar(value=str(RESULT_SUBDIRS["image_to_ascii"] / "result_ascii.png")),
+        "ascii_text_output": tk.StringVar(),
+        "ascii_charset": tk.StringVar(value=" .,:;!?+=*#%@"),
+        "ascii_font": tk.StringVar(),
+        "ascii_font_size": tk.StringVar(value="12"),
+        "video_output": tk.StringVar(value=str(RESULT_SUBDIRS["image_to_video"] / "result_progress.gif")),
         "video_to_video_input": tk.StringVar(),
-        "video_to_video_output": tk.StringVar(value="result_video_emoji.mp4"),
+        "video_to_video_output": tk.StringVar(value=str(RESULT_SUBDIRS["video_to_video"] / "result_video_emoji.mp4")),
         "columns": tk.StringVar(value="80"),
         "rows": tk.StringVar(),
         "emoji_size": tk.StringVar(value="20"),
@@ -1539,8 +1699,12 @@ def launch_gui() -> None:
         "video_step_columns": tk.StringVar(value="2"),
     }
     stretch_var = tk.BooleanVar(value=False)
+    ascii_color_var = tk.BooleanVar(value=True)
+    ascii_invert_var = tk.BooleanVar(value=False)
     status_var = tk.StringVar(value="Choisissez un mode puis configurez les paramètres communs.")
     estimate_var = tk.StringVar(value="Estimation : n/a")
+    progress_detail_var = tk.StringVar(value="En attente")
+    progress_var = tk.DoubleVar(value=0.0)
     is_running = {"value": False}
     current_mode = {"value": "image_to_image"}
     recent_banned_emojis: List[str] = []
@@ -1553,29 +1717,94 @@ def launch_gui() -> None:
     }
     browser_catalog = {"emojis": []}
     restoring_settings = {"value": False}
+    recent_preview_refs: list[ImageTk.PhotoImage] = []
+    recent_preview_widgets: list[tk.Widget] = []
+    hero_preview_refs: list[ImageTk.PhotoImage] = []
 
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
 
-    outer = ttk.Frame(root, style="App.TFrame")
+    outer = ttk.Frame(root, style="App.TFrame", padding=18)
     outer.grid(sticky="nsew")
-    outer.columnconfigure(0, weight=1)
+    outer.columnconfigure(0, weight=0)
+    outer.columnconfigure(1, weight=1)
     outer.rowconfigure(0, weight=1)
 
+    sidebar = ttk.Frame(outer, style="Sidebar.TFrame", padding=16)
+    sidebar.grid(row=0, column=0, sticky="nsw", padx=(0, 18))
+    sidebar.configure(width=310)
+    sidebar.grid_propagate(False)
+    sidebar.columnconfigure(0, weight=1)
+    sidebar.rowconfigure(2, weight=1)
+
+    recent_header = ttk.Frame(sidebar, style="Sidebar.TFrame")
+    recent_header.grid(row=0, column=0, sticky="ew")
+    recent_header.columnconfigure(0, weight=1)
+    ttk.Label(recent_header, text="Récents", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        recent_header,
+        text="Les derniers rendus apparaissent ici avec aperçu. Clique pour les réutiliser.",
+        style="SidebarMuted.TLabel",
+        wraplength=260,
+        justify="left",
+    ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+    recent_hint = ttk.Label(
+        sidebar,
+        text="Aucun rendu pour le moment.",
+        style="SidebarMuted.TLabel",
+        wraplength=260,
+        justify="left",
+    )
+    recent_hint.grid(row=1, column=0, sticky="ew", pady=(14, 12))
+
+    recent_canvas = tk.Canvas(sidebar, background=panel_bg, highlightthickness=0, bd=0)
+    recent_canvas.grid(row=2, column=0, sticky="nsew")
+    recent_scrollbar = tk.Scrollbar(
+        sidebar,
+        orient="vertical",
+        command=recent_canvas.yview,
+        relief="flat",
+        bd=0,
+        bg="#202b41",
+        troughcolor="#0f1526",
+        activebackground="#2c3a57",
+        highlightthickness=0,
+    )
+    recent_scrollbar.grid(row=2, column=1, sticky="ns")
+    recent_canvas.configure(yscrollcommand=recent_scrollbar.set)
+    recent_gallery = ttk.Frame(recent_canvas, style="Sidebar.TFrame")
+    recent_gallery.columnconfigure(0, weight=1)
+    recent_gallery_window = recent_canvas.create_window((0, 0), window=recent_gallery, anchor="nw")
+
+    workspace = ttk.Frame(outer, style="App.TFrame")
+    workspace.grid(row=0, column=1, sticky="nsew")
+    workspace.columnconfigure(0, weight=1)
+    workspace.rowconfigure(0, weight=1)
+
     canvas = tk.Canvas(
-        outer,
-        background="#f3f6fb",
+        workspace,
+        background=shell_bg,
         highlightthickness=0,
         bd=0,
     )
     canvas.grid(row=0, column=0, sticky="nsew")
 
-    scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    scrollbar = tk.Scrollbar(
+        workspace,
+        orient="vertical",
+        command=canvas.yview,
+        relief="flat",
+        bd=0,
+        bg="#202b41",
+        troughcolor="#0f1526",
+        activebackground="#2c3a57",
+        highlightthickness=0,
+    )
     scrollbar.grid(row=0, column=1, sticky="ns")
     canvas.configure(yscrollcommand=scrollbar.set)
 
-    container = ttk.Frame(canvas, padding=22, style="App.TFrame")
-    container.columnconfigure(0, weight=1)
+    container = ttk.Frame(canvas, padding=6, style="App.TFrame")
     container.columnconfigure(0, weight=1)
     container.rowconfigure(1, weight=1)
     canvas_window = canvas.create_window((0, 0), window=container, anchor="nw")
@@ -1587,6 +1816,14 @@ def launch_gui() -> None:
         width = getattr(event, "width", None)
         if width is not None:
             canvas.itemconfigure(canvas_window, width=width)
+
+    def update_recent_scroll_region(_event: object | None = None) -> None:
+        recent_canvas.configure(scrollregion=recent_canvas.bbox("all"))
+
+    def update_recent_canvas_width(event: object) -> None:
+        width = getattr(event, "width", None)
+        if width is not None:
+            recent_canvas.itemconfigure(recent_gallery_window, width=width)
 
     def on_mousewheel(event: object) -> None:
         delta = getattr(event, "delta", 0)
@@ -1601,6 +1838,8 @@ def launch_gui() -> None:
 
     container.bind("<Configure>", update_scroll_region)
     canvas.bind("<Configure>", update_canvas_width)
+    recent_gallery.bind("<Configure>", update_recent_scroll_region)
+    recent_canvas.bind("<Configure>", update_recent_canvas_width)
     canvas.bind_all("<MouseWheel>", on_mousewheel)
     canvas.bind_all("<Button-4>", on_linux_scroll_up)
     canvas.bind_all("<Button-5>", on_linux_scroll_down)
@@ -1608,12 +1847,13 @@ def launch_gui() -> None:
     header = ttk.Frame(container, style="App.TFrame")
     header.grid(row=0, column=0, sticky="ew")
     header.columnconfigure(0, weight=1)
-    ttk.Label(header, text="imgEMOJI", style="Hero.TLabel").grid(row=0, column=0, sticky="w")
+    header.columnconfigure(1, weight=0)
+    ttk.Label(header, text="imgEMOJI Studio", style="Hero.TLabel").grid(row=0, column=0, sticky="w")
     ttk.Label(
         header,
-        text="Trois modes séparés, des paramètres communs, et des champs expliqués sans surcharger l'écran.",
+        text="Un flux unique pour générer en emoji ou en ASCII, avec galerie récente, progression lisible et sorties jamais écrasées.",
         style="Muted.TLabel",
-        wraplength=920,
+        wraplength=980,
         justify="left",
     ).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
@@ -1622,9 +1862,92 @@ def launch_gui() -> None:
     main_frame.columnconfigure(0, weight=1)
     main_frame.rowconfigure(1, weight=1)
 
-    shared_frame = ttk.LabelFrame(main_frame, text="Paramètres communs", padding=16, style="Section.TLabelframe")
-    shared_frame.grid(row=0, column=0, sticky="ew")
+    intro_frame = ttk.Frame(main_frame, style="Panel.TFrame", padding=28)
+    intro_frame.grid(row=0, column=0, sticky="nsew")
+    intro_frame.columnconfigure(0, weight=1)
+
+    intro_card = ttk.Frame(intro_frame, style="Card.TFrame", padding=28)
+    intro_card.grid(row=0, column=0, sticky="ew")
+    intro_card.columnconfigure(0, weight=1)
+    ttk.Label(intro_card, text="Choisis un mode pour commencer", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        intro_card,
+        text="La galerie récente reste à gauche. Clique sur + pour ouvrir uniquement le formulaire du mode voulu, puis lance la génération.",
+        style="Info.TLabel",
+        wraplength=760,
+        justify="left",
+    ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+    intro_generate_button = tk.Button(
+        intro_card,
+        text="+ Générer",
+        command=lambda: None,
+        relief="flat",
+        bd=0,
+        padx=22,
+        pady=14,
+        font=("TkDefaultFont", 12, "bold"),
+        bg=accent,
+        fg="#08101d",
+        activebackground="#7ac8ff",
+        activeforeground="#08101d",
+        cursor="hand2",
+    )
+    intro_generate_button.grid(row=2, column=0, sticky="w", pady=(18, 0))
+
+    hero_preview_card = ttk.Frame(intro_frame, style="Card.TFrame", padding=18)
+    hero_preview_card.grid(row=1, column=0, sticky="nsew", pady=(18, 0))
+    hero_preview_card.columnconfigure(0, weight=1)
+    ttk.Label(hero_preview_card, text="Aperçu", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+    hero_preview_label = tk.Label(
+        hero_preview_card,
+        text="Clique sur un rendu récent pour l'afficher ici.",
+        justify="center",
+        wraplength=760,
+        bg=card_bg,
+        fg=text_muted,
+        padx=16,
+        pady=16,
+    )
+    hero_preview_label.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+
+    editor_frame = ttk.Frame(main_frame, style="App.TFrame")
+    editor_frame.grid(row=1, column=0, sticky="nsew")
+    editor_frame.columnconfigure(0, weight=1)
+    editor_frame.rowconfigure(1, weight=1)
+    editor_frame.grid_remove()
+
+    shared_frame = ttk.LabelFrame(editor_frame, text="Configuration", padding=16, style="Section.TLabelframe")
+    shared_frame.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
     shared_frame.columnconfigure(0, weight=1)
+    shared_frame.rowconfigure(13, weight=1)
+
+    def create_action_button(
+        parent: tk.Misc,
+        text: str,
+        command: Callable[[], None],
+        *,
+        accent_button: bool = False,
+        width: int | None = None,
+    ) -> tk.Button:
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            width=width,
+            relief="flat",
+            bd=0,
+            padx=16,
+            pady=10,
+            font=("TkDefaultFont", 10, "bold"),
+            bg=accent if accent_button else "#202b41",
+            fg="#08101d" if accent_button else text_primary,
+            activebackground="#7ac8ff" if accent_button else "#2c3a57",
+            activeforeground="#08101d" if accent_button else text_primary,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+
+    shared_control_rows: dict[str, tk.Widget] = {}
 
     def add_row(
         parent: ttk.Frame,
@@ -1636,9 +1959,10 @@ def launch_gui() -> None:
         button_text: str = "Parcourir",
         width: int = 18,
         stretch: bool = False,
-    ) -> ttk.Entry:
+    ) -> tk.Entry:
         row_frame = ttk.Frame(parent, style="Card.TFrame")
         row_frame.grid(row=row, column=0, sticky="ew", pady=5)
+        shared_control_rows[key] = row_frame
         row_frame.columnconfigure(0, weight=1)
 
         text_frame = ttk.Frame(row_frame, style="Card.TFrame")
@@ -1657,46 +1981,76 @@ def launch_gui() -> None:
         control_frame.grid(row=0, column=1, sticky="e")
         if stretch:
             control_frame.columnconfigure(0, weight=1)
-        entry = ttk.Entry(control_frame, textvariable=field_vars[key], width=width)
+        entry = tk.Entry(
+            control_frame,
+            textvariable=field_vars[key],
+            width=width,
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=border,
+            highlightcolor=accent,
+            bg="#0f1526",
+            fg=text_primary,
+            insertbackground=text_primary,
+        )
         entry.grid(row=0, column=0, sticky="ew" if stretch else "w")
         if browse == "open":
-            ttk.Button(
+            create_action_button(
                 control_frame,
                 text=button_text,
                 command=lambda: choose_input_file(),
             ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "video_input":
-            ttk.Button(
+            create_action_button(
                 control_frame,
                 text=button_text,
                 command=lambda: choose_video_input_file(),
             ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "save":
-            ttk.Button(
+            create_action_button(
                 control_frame,
                 text=button_text,
                 command=lambda: choose_output_file(),
             ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        elif browse == "ascii_save":
+            create_action_button(
+                control_frame,
+                text=button_text,
+                command=lambda: choose_ascii_output_file(),
+            ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        elif browse == "ascii_text_save":
+            create_action_button(
+                control_frame,
+                text=button_text,
+                command=lambda: choose_ascii_text_output_file(),
+            ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "mp4_save":
-            ttk.Button(
+            create_action_button(
                 control_frame,
                 text=button_text,
                 command=lambda: choose_video_to_video_output_file(),
             ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "font":
-            ttk.Button(
+            create_action_button(
                 control_frame,
                 text=button_text,
                 command=lambda: choose_font_file(),
             ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        elif browse == "ascii_font":
+            create_action_button(
+                control_frame,
+                text=button_text,
+                command=lambda: choose_ascii_font_file(),
+            ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "video":
-            ttk.Button(
+            create_action_button(
                 control_frame,
                 text=button_text,
                 command=lambda: choose_video_file(),
             ).grid(row=0, column=1, sticky="w", padx=(10, 0))
         elif browse == "banned_browser":
-            ttk.Button(
+            create_action_button(
                 control_frame,
                 text=button_text,
                 command=lambda: open_banned_emoji_browser(),
@@ -1715,19 +2069,45 @@ def launch_gui() -> None:
             return
         field_vars["input"].set(path)
         input_path = Path(path)
-        if not field_vars["output"].get().strip() or field_vars["output"].get().strip() == "result.png":
-            field_vars["output"].set(str(input_path.with_name(f"{input_path.stem}_emoji.png")))
-        if not field_vars["video_output"].get().strip() or field_vars["video_output"].get().strip() == "result_progress.gif":
-            field_vars["video_output"].set(str(input_path.with_name(f"{input_path.stem}_progress.gif")))
+        if is_default_output_value(field_vars["output"].get(), "image_to_image"):
+            field_vars["output"].set(build_default_output_path(input_path, "emoji", ".png"))
+        if is_default_output_value(field_vars["ascii_output"].get(), "image_to_ascii"):
+            field_vars["ascii_output"].set(build_default_output_path(input_path, "ascii", ".png"))
+        if is_default_output_value(field_vars["video_output"].get(), "image_to_video"):
+            field_vars["video_output"].set(build_default_output_path(input_path, "progress", ".gif"))
 
     def choose_output_file() -> None:
+        RESULT_SUBDIRS["image_to_image"].mkdir(parents=True, exist_ok=True)
         path = filedialog.asksaveasfilename(
             title="Choisir le fichier de sortie",
             defaultextension=".png",
+            initialdir=str(RESULT_SUBDIRS["image_to_image"]),
             filetypes=[("PNG", "*.png"), ("Tous les fichiers", "*.*")],
         )
         if path:
             field_vars["output"].set(path)
+
+    def choose_ascii_output_file() -> None:
+        RESULT_SUBDIRS["image_to_ascii"].mkdir(parents=True, exist_ok=True)
+        path = filedialog.asksaveasfilename(
+            title="Choisir la sortie ASCII",
+            defaultextension=".png",
+            initialdir=str(RESULT_SUBDIRS["image_to_ascii"]),
+            filetypes=[("PNG", "*.png"), ("Texte", "*.txt"), ("Tous les fichiers", "*.*")],
+        )
+        if path:
+            field_vars["ascii_output"].set(path)
+
+    def choose_ascii_text_output_file() -> None:
+        RESULT_SUBDIRS["image_to_ascii"].mkdir(parents=True, exist_ok=True)
+        path = filedialog.asksaveasfilename(
+            title="Choisir le fichier texte ASCII",
+            defaultextension=".txt",
+            initialdir=str(RESULT_SUBDIRS["image_to_ascii"]),
+            filetypes=[("Texte", "*.txt"), ("Tous les fichiers", "*.*")],
+        )
+        if path:
+            field_vars["ascii_text_output"].set(path)
 
     def choose_font_file() -> None:
         path = filedialog.askopenfilename(
@@ -1740,10 +2120,23 @@ def launch_gui() -> None:
         if path:
             field_vars["font"].set(path)
 
+    def choose_ascii_font_file() -> None:
+        path = filedialog.askopenfilename(
+            title="Choisir une police monospace ASCII",
+            filetypes=[
+                ("Polices", "*.ttf *.ttc *.otf"),
+                ("Tous les fichiers", "*.*"),
+            ],
+        )
+        if path:
+            field_vars["ascii_font"].set(path)
+
     def choose_video_file() -> None:
+        RESULT_SUBDIRS["image_to_video"].mkdir(parents=True, exist_ok=True)
         path = filedialog.asksaveasfilename(
             title="Choisir le fichier vidéo/animation",
             defaultextension=".gif",
+            initialdir=str(RESULT_SUBDIRS["image_to_video"]),
             filetypes=[("GIF animé", "*.gif"), ("MP4", "*.mp4"), ("Tous les fichiers", "*.*")],
         )
         if path:
@@ -1758,13 +2151,15 @@ def launch_gui() -> None:
             return
         field_vars["video_to_video_input"].set(path)
         input_path = Path(path)
-        if not field_vars["video_to_video_output"].get().strip() or field_vars["video_to_video_output"].get().strip() == "result_video_emoji.mp4":
-            field_vars["video_to_video_output"].set(str(input_path.with_name(f"{input_path.stem}_emoji.mp4")))
+        if is_default_output_value(field_vars["video_to_video_output"].get(), "video_to_video"):
+            field_vars["video_to_video_output"].set(build_default_output_path(input_path, "emoji", ".mp4"))
 
     def choose_video_to_video_output_file() -> None:
+        RESULT_SUBDIRS["video_to_video"].mkdir(parents=True, exist_ok=True)
         path = filedialog.asksaveasfilename(
             title="Choisir la vidéo de sortie",
             defaultextension=".mp4",
+            initialdir=str(RESULT_SUBDIRS["video_to_video"]),
             filetypes=[("MP4", "*.mp4"), ("Tous les fichiers", "*.*")],
         )
         if path:
@@ -1808,6 +2203,8 @@ def launch_gui() -> None:
             "rows": field_vars["rows"].get(),
             "emoji_size": field_vars["emoji_size"].get(),
             "scale": field_vars["scale"].get(),
+            "ascii_charset": field_vars["ascii_charset"].get(),
+            "ascii_font_size": field_vars["ascii_font_size"].get(),
             "palette": field_vars["palette"].get(),
             "banned_palette": field_vars["banned_palette"].get(),
             "background": field_vars["background"].get(),
@@ -1818,6 +2215,8 @@ def launch_gui() -> None:
             "video_max_columns": field_vars["video_max_columns"].get(),
             "video_step_columns": field_vars["video_step_columns"].get(),
             "stretch": stretch_var.get(),
+            "ascii_color": ascii_color_var.get(),
+            "ascii_invert": ascii_invert_var.get(),
             "recent_banned_emojis": recent_banned_emojis,
         }
         save_gui_settings(settings)
@@ -1835,6 +2234,8 @@ def launch_gui() -> None:
                 "rows",
                 "emoji_size",
                 "scale",
+                "ascii_charset",
+                "ascii_font_size",
                 "palette",
                 "banned_palette",
                 "background",
@@ -1853,6 +2254,12 @@ def launch_gui() -> None:
             stretch_value = settings.get("stretch")
             if isinstance(stretch_value, bool):
                 stretch_var.set(stretch_value)
+            ascii_color_value = settings.get("ascii_color")
+            if isinstance(ascii_color_value, bool):
+                ascii_color_var.set(ascii_color_value)
+            ascii_invert_value = settings.get("ascii_invert")
+            if isinstance(ascii_invert_value, bool):
+                ascii_invert_var.set(ascii_invert_value)
             saved_recent = settings.get("recent_banned_emojis")
             if isinstance(saved_recent, list):
                 recent_banned_emojis[:] = [str(item) for item in saved_recent if isinstance(item, str)]
@@ -1923,7 +2330,7 @@ def launch_gui() -> None:
         browser_window.title("Emojis bannis")
         browser_window.geometry("860x640")
         browser_window.minsize(720, 480)
-        browser_window.configure(bg="#f3f6fb")
+        browser_window.configure(bg=shell_bg)
         browser_window.transient(root)
         browser_window.columnconfigure(0, weight=1)
         browser_window.rowconfigure(1, weight=1)
@@ -1941,7 +2348,19 @@ def launch_gui() -> None:
         header_frame.grid(row=0, column=0, sticky="ew")
         header_frame.columnconfigure(1, weight=1)
         ttk.Label(header_frame, text="Emojis bannis", style="Hero.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Entry(header_frame, textvariable=browser_state["search_var"], width=28).grid(row=0, column=1, sticky="e")
+        tk.Entry(
+            header_frame,
+            textvariable=browser_state["search_var"],
+            width=28,
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=border,
+            highlightcolor=accent,
+            bg="#0f1526",
+            fg=text_primary,
+            insertbackground=text_primary,
+        ).grid(row=0, column=1, sticky="e")
         ttk.Label(
             header_frame,
             text="Recherche par emoji, nom Unicode, ou codepoint. Les plus recents restent en haut.",
@@ -1955,9 +2374,19 @@ def launch_gui() -> None:
         content_frame.columnconfigure(0, weight=1)
         content_frame.rowconfigure(0, weight=1)
 
-        browser_canvas = tk.Canvas(content_frame, background="#f3f6fb", highlightthickness=0, bd=0)
+        browser_canvas = tk.Canvas(content_frame, background=shell_bg, highlightthickness=0, bd=0)
         browser_canvas.grid(row=0, column=0, sticky="nsew")
-        browser_scrollbar = ttk.Scrollbar(content_frame, orient="vertical", command=browser_canvas.yview)
+        browser_scrollbar = tk.Scrollbar(
+            content_frame,
+            orient="vertical",
+            command=browser_canvas.yview,
+            relief="flat",
+            bd=0,
+            bg="#202b41",
+            troughcolor="#0f1526",
+            activebackground="#2c3a57",
+            highlightthickness=0,
+        )
         browser_scrollbar.grid(row=0, column=1, sticky="ns")
         browser_canvas.configure(yscrollcommand=browser_scrollbar.set)
 
@@ -2150,12 +2579,25 @@ def launch_gui() -> None:
         wraplength=560,
         justify="left",
     ).grid(row=1, column=0, sticky="w", pady=(2, 0))
-    source_combo = ttk.Combobox(
-        source_row,
-        textvariable=field_vars["emoji_source"],
-        values=("auto", "font", "twemoji"),
-        state="readonly",
-        width=14,
+    source_combo = tk.OptionMenu(source_row, field_vars["emoji_source"], "auto", "font", "twemoji")
+    source_combo.configure(
+        relief="flat",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground=border,
+        highlightcolor=accent,
+        bg="#0f1526",
+        fg=text_primary,
+        activebackground="#202b41",
+        activeforeground=text_primary,
+        width=12,
+    )
+    source_combo["menu"].configure(
+        bg="#0f1526",
+        fg=text_primary,
+        activebackground=accent,
+        activeforeground="#08101d",
+        bd=0,
     )
     source_combo.grid(row=0, column=1, sticky="e")
 
@@ -2166,6 +2608,7 @@ def launch_gui() -> None:
         stretch_row,
         text="Autoriser l'étirement si colonnes + lignes sont définies",
         variable=stretch_var,
+        style="Dark.TCheckbutton",
     ).grid(row=0, column=0, sticky="w")
     ttk.Label(
         stretch_row,
@@ -2176,25 +2619,99 @@ def launch_gui() -> None:
     ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
     help_text = (
-        "Les champs ici sont partagés par `Image -> Image` et `Image -> Vidéo`. "
-        "Tu règles la matière commune une fois, puis tu choisis seulement la sortie dans l'onglet voulu."
+        "Ces réglages s'appliquent au mode choisi. Ils restent masqués tant que tu n'as pas sélectionné un type de génération."
     )
-    ttk.Label(shared_frame, text=help_text, wraplength=860, justify="left").grid(
+    shared_help_label = ttk.Label(shared_frame, text=help_text, wraplength=860, justify="left", style="Info.TLabel")
+    shared_help_label.grid(
         row=12, column=0, sticky="w", pady=(8, 0)
     )
 
-    notebook = ttk.Notebook(main_frame)
-    notebook.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
+    shared_mode_visibility = {
+        "image_to_image": {"input", "columns", "rows", "emoji_size", "scale", "palette", "banned_palette", "background", "font", "alpha_threshold", "emoji_source", "stretch", "shared_help"},
+        "image_to_ascii": {"input", "columns", "rows", "scale", "background", "shared_help"},
+        "image_to_video": {"input", "columns", "rows", "emoji_size", "scale", "palette", "banned_palette", "background", "font", "alpha_threshold", "emoji_source", "stretch", "shared_help"},
+        "video_to_video": {"columns", "rows", "emoji_size", "scale", "palette", "banned_palette", "background", "font", "alpha_threshold", "emoji_source", "stretch", "shared_help"},
+    }
 
-    image_tab = ttk.Frame(notebook, padding=18, style="App.TFrame")
-    video_tab = ttk.Frame(notebook, padding=18, style="App.TFrame")
-    future_tab = ttk.Frame(notebook, padding=18, style="App.TFrame")
-    for tab in (image_tab, video_tab, future_tab):
+    def update_shared_fields_visibility(mode: str) -> None:
+        visible_keys = shared_mode_visibility.get(mode, set())
+        for key, widget in shared_control_rows.items():
+            if key in visible_keys:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        if "emoji_source" in visible_keys:
+            source_row.grid()
+        else:
+            source_row.grid_remove()
+        if "stretch" in visible_keys:
+            stretch_row.grid()
+        else:
+            stretch_row.grid_remove()
+        if "shared_help" in visible_keys:
+            shared_help_label.grid()
+        else:
+            shared_help_label.grid_remove()
+
+    mode_titles = {
+        "image_to_image": "Image -> Image",
+        "image_to_ascii": "Image -> ASCII",
+        "image_to_video": "Image -> Vidéo",
+        "video_to_video": "Vidéo -> Vidéo",
+    }
+    generate_labels = {
+        "image_to_image": "Générer l'image",
+        "image_to_ascii": "Générer l'ASCII",
+        "image_to_video": "Créer la vidéo",
+        "video_to_video": "Créer la vidéo emoji",
+    }
+    mode_summary_var = tk.StringVar(value="Mode actif : Image -> Image")
+
+    mode_bar = ttk.Frame(editor_frame, style="Panel.TFrame", padding=16)
+    mode_bar.grid(row=0, column=0, sticky="ew")
+    mode_bar.columnconfigure(0, weight=1)
+    ttk.Label(mode_bar, textvariable=mode_summary_var, style="Title.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        mode_bar,
+        text="Seul le mode actif reste affiché. Reviens à l'accueil ou change de mode avec +.",
+        style="SidebarMuted.TLabel",
+        wraplength=640,
+        justify="left",
+    ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+    mode_menu_button = tk.Button(
+        mode_bar,
+        text="+ Générer",
+        command=lambda: None,
+        relief="flat",
+        bd=0,
+        padx=18,
+        pady=10,
+        font=("TkDefaultFont", 11, "bold"),
+        bg="#202b41",
+        fg=text_primary,
+        activebackground="#2c3a57",
+        activeforeground=text_primary,
+        cursor="hand2",
+    )
+    mode_menu_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(16, 12))
+
+    home_button = create_action_button(mode_bar, "Accueil", lambda: None)
+    home_button.grid(row=0, column=2, rowspan=2, sticky="e", padx=(0, 12))
+
+    mode_content = ttk.Frame(shared_frame, style="App.TFrame")
+    mode_content.grid(row=13, column=0, sticky="nsew", pady=(18, 0))
+    mode_content.columnconfigure(0, weight=1)
+    mode_content.rowconfigure(0, weight=1)
+
+    image_tab = ttk.Frame(mode_content, padding=(0, 0, 0, 0), style="App.TFrame")
+    ascii_tab = ttk.Frame(mode_content, padding=(0, 0, 0, 0), style="App.TFrame")
+    video_tab = ttk.Frame(mode_content, padding=(0, 0, 0, 0), style="App.TFrame")
+    future_tab = ttk.Frame(mode_content, padding=(0, 0, 0, 0), style="App.TFrame")
+    for tab in (image_tab, ascii_tab, video_tab, future_tab):
         tab.columnconfigure(0, weight=1)
-
-    notebook.add(image_tab, text="Image -> Image")
-    notebook.add(video_tab, text="Image -> Vidéo")
-    notebook.add(future_tab, text="Vidéo -> Vidéo")
+        tab.grid(row=0, column=0, sticky="nsew")
+        tab.grid_remove()
 
     image_card = ttk.LabelFrame(image_tab, text="Sortie image", padding=16, style="Section.TLabelframe")
     image_card.grid(row=0, column=0, sticky="ew")
@@ -2211,13 +2728,56 @@ def launch_gui() -> None:
         wraplength=760,
         justify="left",
     ).grid(row=1, column=0, sticky="w", pady=(10, 0))
-
-    image_buttons = ttk.Frame(image_tab)
-    image_buttons.grid(row=1, column=0, sticky="ew", pady=(14, 0))
-    image_buttons.columnconfigure(1, weight=1)
-    ttk.Button(image_buttons, text="Générer l'image", command=lambda: on_render()).grid(row=0, column=0, sticky="w")
-    ttk.Button(image_buttons, text="Quitter", command=root.destroy).grid(row=0, column=2, sticky="e")
-
+    ascii_card = ttk.LabelFrame(ascii_tab, text="Sortie ASCII", padding=16, style="Section.TLabelframe")
+    ascii_card.grid(row=0, column=0, sticky="ew")
+    ascii_card.columnconfigure(0, weight=1)
+    add_row(
+        ascii_card, 0, "Sortie ASCII",
+        "Le fichier final ASCII, en `.png` ou `.txt`.",
+        "ascii_output", browse="ascii_save", width=38, stretch=True,
+    )
+    add_row(
+        ascii_card, 1, "Texte ASCII",
+        "Optionnel. Sauvegarde aussi la version texte brute dans un fichier `.txt`.",
+        "ascii_text_output", browse="ascii_text_save", width=38, stretch=True,
+    )
+    add_row(
+        ascii_card, 2, "Charset",
+        "Caractères du plus clair au plus sombre. Exemple : ` .,:;!?+=*#%@`.",
+        "ascii_charset", width=26,
+    )
+    add_row(
+        ascii_card, 3, "Police ASCII",
+        "Optionnel. Police monospace utilisée pour le rendu PNG ASCII.",
+        "ascii_font", browse="ascii_font", width=34,
+    )
+    add_row(
+        ascii_card, 4, "Taille police",
+        "Taille de la police pour le rendu PNG ASCII.",
+        "ascii_font_size", width=10,
+    )
+    ascii_options = ttk.Frame(ascii_card, style="Card.TFrame")
+    ascii_options.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+    ascii_options.columnconfigure(0, weight=1)
+    ttk.Checkbutton(
+        ascii_options,
+        text="Rendu coloré",
+        variable=ascii_color_var,
+        style="Dark.TCheckbutton",
+    ).grid(row=0, column=0, sticky="w")
+    ttk.Checkbutton(
+        ascii_options,
+        text="Inverser le charset",
+        variable=ascii_invert_var,
+        style="Dark.TCheckbutton",
+    ).grid(row=0, column=1, sticky="w", padx=(18, 0))
+    ttk.Label(
+        ascii_card,
+        text="Le mode ASCII réutilise l'image d'entrée, les colonnes, lignes, scale et le fond définis dans les paramètres communs.",
+        style="Info.TLabel",
+        wraplength=760,
+        justify="left",
+    ).grid(row=6, column=0, sticky="w", pady=(10, 0))
     video_card = ttk.LabelFrame(video_tab, text="Sortie vidéo", padding=16, style="Section.TLabelframe")
     video_card.grid(row=0, column=0, sticky="ew")
     video_card.columnconfigure(0, weight=1)
@@ -2253,13 +2813,6 @@ def launch_gui() -> None:
         wraplength=760,
         justify="left",
     ).grid(row=5, column=0, sticky="w", pady=(10, 0))
-
-    video_buttons = ttk.Frame(video_tab)
-    video_buttons.grid(row=1, column=0, sticky="ew", pady=(14, 0))
-    video_buttons.columnconfigure(1, weight=1)
-    ttk.Button(video_buttons, text="Créer la vidéo", command=lambda: on_video_render()).grid(row=0, column=0, sticky="w")
-    ttk.Button(video_buttons, text="Quitter", command=root.destroy).grid(row=0, column=2, sticky="e")
-
     future_card = ttk.LabelFrame(future_tab, text="Vidéo -> Vidéo", padding=18, style="Section.TLabelframe")
     future_card.grid(row=0, column=0, sticky="nsew")
     future_card.columnconfigure(0, weight=1)
@@ -2288,20 +2841,19 @@ def launch_gui() -> None:
         justify="left",
         wraplength=760,
     ).grid(row=3, column=0, sticky="w", pady=(10, 0))
-
-    future_buttons = ttk.Frame(future_tab)
-    future_buttons.grid(row=1, column=0, sticky="ew", pady=(14, 0))
-    future_buttons.columnconfigure(1, weight=1)
-    ttk.Button(future_buttons, text="Créer la vidéo emoji", command=lambda: on_video_to_video_render()).grid(row=0, column=0, sticky="w")
-    ttk.Button(future_buttons, text="Quitter", command=root.destroy).grid(row=0, column=2, sticky="e")
-
-    footer = ttk.Frame(main_frame, style="App.TFrame")
+    footer = ttk.Frame(editor_frame, style="App.TFrame")
     footer.grid(row=2, column=0, sticky="ew", pady=(14, 0))
     footer.columnconfigure(0, weight=1)
+    generate_button = create_action_button(footer, "Générer l'image", lambda: None, accent_button=True)
+    generate_button.grid(row=0, column=1, sticky="e", pady=(0, 12))
     status_label = ttk.Label(footer, textvariable=status_var, wraplength=900, justify="left", style="Status.TLabel")
-    status_label.grid(row=0, column=0, sticky="ew")
+    status_label.grid(row=1, column=0, columnspan=2, sticky="ew")
+    detail_label = ttk.Label(footer, textvariable=progress_detail_var, wraplength=900, justify="left", style="Muted.TLabel")
+    detail_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    progressbar = ttk.Progressbar(footer, variable=progress_var, maximum=100.0, style="Dark.Horizontal.TProgressbar")
+    progressbar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
     estimate_label = ttk.Label(footer, textvariable=estimate_var, wraplength=900, justify="left", style="Muted.TLabel")
-    estimate_label.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+    estimate_label.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
     def walk_children(widget: tk.Misc) -> list[tk.Misc]:
         nodes = [widget]
@@ -2310,17 +2862,31 @@ def launch_gui() -> None:
         return nodes
 
     def set_controls_state(state: str) -> None:
-        for child in walk_children(container):
+        for child in walk_children(outer):
+            if isinstance(child, tk.Button):
+                child.configure(state="disabled" if state == "disabled" else "normal")
+                continue
+            if isinstance(child, tk.Menubutton):
+                child.configure(state="disabled" if state == "disabled" else "normal")
+                continue
             if isinstance(child, (ttk.Entry, ttk.Button, ttk.Combobox, ttk.Checkbutton)):
                 try:
                     child.state([state] if state in ("disabled", "!disabled") else [])
                 except tk.TclError:
                     pass
+        mode_menu_button.configure(state="disabled" if state == "disabled" else "normal")
+        home_button.configure(state="disabled" if state == "disabled" else "normal")
+        generate_button.configure(state="disabled" if state == "disabled" else "normal")
 
     def collect_values() -> dict[str, str | bool]:
         return {
             "input": field_vars["input"].get(),
             "output": field_vars["output"].get(),
+            "ascii_output": field_vars["ascii_output"].get(),
+            "ascii_text_output": field_vars["ascii_text_output"].get(),
+            "ascii_charset": field_vars["ascii_charset"].get(),
+            "ascii_font": field_vars["ascii_font"].get(),
+            "ascii_font_size": field_vars["ascii_font_size"].get(),
             "video_output": field_vars["video_output"].get(),
             "video_to_video_input": field_vars["video_to_video_input"].get(),
             "video_to_video_output": field_vars["video_to_video_output"].get(),
@@ -2339,20 +2905,154 @@ def launch_gui() -> None:
             "video_max_columns": field_vars["video_max_columns"].get(),
             "video_step_columns": field_vars["video_step_columns"].get(),
             "stretch": stretch_var.get(),
+            "ascii_color": ascii_color_var.get(),
+            "ascii_invert": ascii_invert_var.get(),
         }
 
     def get_active_mode() -> str:
-        selected_tab = notebook.select()
-        if selected_tab == str(image_tab):
-            return "image_to_image"
-        if selected_tab == str(video_tab):
-            return "image_to_video"
-        return "video_to_video"
+        return current_mode["value"]
+
+    def open_mode_menu(anchor_widget: tk.Widget) -> None:
+        try:
+            x = anchor_widget.winfo_rootx()
+            y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height()
+            mode_menu.tk_popup(x, y)
+        finally:
+            mode_menu.grab_release()
+
+    def switch_mode(mode: str) -> None:
+        current_mode["value"] = mode
+        intro_frame.grid_remove()
+        editor_frame.grid()
+        update_shared_fields_visibility(mode)
+        for panel in (image_tab, ascii_tab, video_tab, future_tab):
+            panel.grid_remove()
+        if mode == "image_to_image":
+            image_tab.grid()
+        elif mode == "image_to_ascii":
+            ascii_tab.grid()
+        elif mode == "image_to_video":
+            video_tab.grid()
+        else:
+            future_tab.grid()
+        refresh_estimate()
+
+    def go_home() -> None:
+        current_mode["value"] = "image_to_image"
+        editor_frame.grid_remove()
+        intro_frame.grid()
+        progress_var.set(0.0)
+        progress_detail_var.set("En attente")
+        status_var.set("Choisissez un mode puis configurez les paramètres.")
+
+    def show_recent_media(path: Path) -> None:
+        hero_preview_refs.clear()
+        suffix = path.suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"} or ImageTk is None:
+            hero_preview_label.configure(
+                image="",
+                text=f"{path.name}\n\nAperçu grand format indisponible pour ce type de fichier.",
+                compound="center",
+            )
+            return
+        try:
+            with Image.open(path) as source:
+                preview = source.convert("RGBA")
+                preview.thumbnail((760, 520), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(preview)
+        except (OSError, Image.DecompressionBombError):
+            hero_preview_label.configure(
+                image="",
+                text=f"{path.name}\n\nImpossible d'afficher cette image en grand.",
+                compound="center",
+            )
+            return
+        hero_preview_refs.append(photo)
+        hero_preview_label.configure(image=photo, text="")
+
+    def refresh_recent_gallery() -> None:
+        for child in recent_gallery.winfo_children():
+            child.destroy()
+        recent_preview_refs.clear()
+        recent_preview_widgets.clear()
+
+        recent_paths = discover_recent_media(limit=12)
+        if not recent_paths:
+            recent_hint.configure(text="Aucun rendu pour le moment. Tes prochains exports apparaîtront ici.")
+            recent_hint.grid()
+            return
+
+        recent_hint.grid_remove()
+        for index, media_path in enumerate(recent_paths):
+            item_frame = ttk.Frame(recent_gallery, style="Card.TFrame", padding=8)
+            item_frame.grid(row=index, column=0, sticky="ew", pady=(0, 10))
+            item_frame.columnconfigure(0, weight=1)
+            button_label = f"{media_path.name}\n{time.strftime('%d/%m %H:%M', time.localtime(media_path.stat().st_mtime))}"
+            if ImageTk is not None:
+                thumbnail = build_recent_thumbnail(media_path)
+                photo = ImageTk.PhotoImage(thumbnail)
+                recent_preview_refs.append(photo)
+                action = tk.Button(
+                    item_frame,
+                    image=photo,
+                    text=button_label,
+                    compound="top",
+                    anchor="w",
+                    justify="left",
+                    wraplength=240,
+                    command=lambda target=media_path: show_recent_media(target),
+                    relief="flat",
+                    bd=0,
+                    padx=8,
+                    pady=8,
+                    bg=card_bg,
+                    fg=text_primary,
+                    activebackground="#24324d",
+                    activeforeground=text_primary,
+                    cursor="hand2",
+                )
+            else:
+                action = tk.Button(
+                    item_frame,
+                    text=button_label,
+                    justify="left",
+                    wraplength=240,
+                    command=lambda target=media_path: show_recent_media(target),
+                    relief="flat",
+                    bd=0,
+                    padx=12,
+                    pady=12,
+                    bg=card_bg,
+                    fg=text_primary,
+                    activebackground="#24324d",
+                    activeforeground=text_primary,
+                    cursor="hand2",
+                )
+            action.grid(row=0, column=0, sticky="ew")
+            recent_preview_widgets.append(action)
+        show_recent_media(recent_paths[0])
+
+    mode_menu = tk.Menu(
+        mode_menu_button,
+        tearoff=False,
+        bg="#202b41",
+        fg=text_primary,
+        activebackground=accent,
+        activeforeground="#08101d",
+        relief="flat",
+        bd=0,
+    )
+    for mode_key, title in mode_titles.items():
+        mode_menu.add_command(label=title, command=lambda selected_mode=mode_key: switch_mode(selected_mode))
+    mode_menu_button.configure(command=lambda: open_mode_menu(mode_menu_button))
+    intro_generate_button.configure(command=lambda: open_mode_menu(intro_generate_button))
 
     def refresh_estimate(*_args: object) -> None:
         if is_running["value"]:
             return
         current_mode["value"] = get_active_mode()
+        mode_summary_var.set(f"Mode actif : {mode_titles[current_mode['value']]}")
+        generate_button.configure(text=generate_labels[current_mode["value"]])
         try:
             args = build_gui_args(collect_values())
             if current_mode["value"] == "image_to_image":
@@ -2366,6 +3066,17 @@ def launch_gui() -> None:
                     f"({int(profile['columns'])}x{int(profile['rows'])}), "
                     f"source {profile['emoji_source']}, "
                     f"historique {estimate.sample_count} échantillon(s), confiance {estimate.confidence}."
+                )
+            elif current_mode["value"] == "image_to_ascii":
+                if not args.input or not args.input.strip():
+                    estimate_var.set("Estimation : choisissez d'abord une image d'entrée.")
+                    return
+                ascii_seconds, ascii_profile = estimate_ascii_for_args(args)
+                estimate_var.set(
+                    "Estimation ASCII : "
+                    f"{format_duration(ascii_seconds)} pour {int(ascii_profile['total_cells'])} cellules "
+                    f"({int(ascii_profile['columns'])}x{int(ascii_profile['rows'])}), "
+                    f"sortie {ascii_profile['output_kind']}."
                 )
             elif current_mode["value"] == "image_to_video":
                 if not args.input or not args.input.strip():
@@ -2395,8 +3106,62 @@ def launch_gui() -> None:
         def report(progress: float, detail: str) -> None:
             bounded = max(0.0, min(1.0, progress))
             percent = int(round(bounded * 100))
-            root.after(0, lambda: status_var.set(f"{prefix} {percent}% | {detail}"))
+            def update_progress() -> None:
+                progress_var.set(percent)
+                progress_detail_var.set(detail)
+                status_var.set(f"{prefix} {percent}%")
+
+            root.after(0, update_progress)
         return report
+
+    def ensure_unique_output_for_key(field_key: str) -> tuple[str | None, str | None]:
+        current_value = field_vars[field_key].get().strip()
+        if not current_value:
+            return None, None
+        unique_value = make_unique_output_path(current_value)
+        if unique_value is None:
+            return None, None
+        if unique_value != current_value:
+            field_vars[field_key].set(unique_value)
+            return unique_value, f"Sortie ajustée pour éviter l'écrasement : {Path(unique_value).name}"
+        return unique_value, None
+
+    def prepare_outputs_for_active_mode(args: argparse.Namespace) -> list[str]:
+        messages: list[str] = []
+        active_mode = current_mode["value"]
+        if active_mode == "image_to_image":
+            unique_path, message = ensure_unique_output_for_key("output")
+            args.output = unique_path or args.output
+            if message:
+                messages.append(message)
+        elif active_mode == "image_to_ascii":
+            unique_path, message = ensure_unique_output_for_key("ascii_output")
+            args.ascii_output = unique_path or args.ascii_output
+            if message:
+                messages.append(message)
+            if field_vars["ascii_text_output"].get().strip():
+                text_unique_path, text_message = ensure_unique_output_for_key("ascii_text_output")
+                args.ascii_text_output = text_unique_path or args.ascii_text_output
+                if text_message:
+                    messages.append(text_message)
+        elif active_mode == "image_to_video":
+            unique_path, message = ensure_unique_output_for_key("video_output")
+            args.video_output = unique_path or args.video_output
+            if message:
+                messages.append(message)
+        else:
+            unique_path, message = ensure_unique_output_for_key("video_to_video_output")
+            args.video_to_video_output = unique_path or args.video_to_video_output
+            if message:
+                messages.append(message)
+        return messages
+
+    def set_busy_state(summary: str, detail: str, progress_percent: float = 4.0) -> None:
+        is_running["value"] = True
+        set_controls_state("disabled")
+        progress_var.set(progress_percent)
+        progress_detail_var.set(detail)
+        status_var.set(summary)
 
     def on_render() -> None:
         if is_running["value"]:
@@ -2415,6 +3180,8 @@ def launch_gui() -> None:
             messagebox.showerror("Paramètres invalides", "Veuillez choisir un fichier de sortie.")
             return
 
+        rename_messages = prepare_outputs_for_active_mode(args)
+
         try:
             estimate, profile = estimate_for_args(args)
         except EmojiMakerError as exc:
@@ -2424,12 +3191,13 @@ def launch_gui() -> None:
             messagebox.showerror("Paramètres invalides", f"Impossible d'estimer le rendu : {exc}")
             return
 
-        is_running["value"] = True
-        set_controls_state("disabled")
-        status_var.set(
+        set_busy_state(
             "Rendu en cours... "
-            f"Estimation {format_duration(estimate.seconds)} pour {int(profile['total_cells'])} cases."
+            f"Estimation {format_duration(estimate.seconds)} pour {int(profile['total_cells'])} cases.",
+            "Préparation du rendu image",
         )
+        if rename_messages:
+            progress_detail_var.set(" | ".join(rename_messages))
 
         def worker() -> None:
             try:
@@ -2447,17 +3215,22 @@ def launch_gui() -> None:
     def on_error(message: str) -> None:
         is_running["value"] = False
         set_controls_state("!disabled")
+        progress_var.set(0.0)
+        progress_detail_var.set("Le rendu a échoué.")
         status_var.set(message)
         messagebox.showerror("Erreur", message)
 
     def on_success(result: RenderResult) -> None:
         is_running["value"] = False
         set_controls_state("!disabled")
+        progress_var.set(100.0)
+        progress_detail_var.set("Image exportée avec succès.")
         status_var.set(
             f"Rendu terminé : {result.output_path} | "
             f"{result.filled_cells} emojis dessinés sur {result.total_cells} cases en {format_duration(result.duration_seconds)}."
         )
         refresh_estimate()
+        refresh_recent_gallery()
         messagebox.showinfo(
             "Succès",
             "Image générée :\n"
@@ -2467,6 +3240,69 @@ def launch_gui() -> None:
             f"Emojis dessinés : {result.filled_cells}\n"
             f"Grille : {result.columns}x{result.rows}\n"
             f"Source emoji : {result.emoji_source}",
+        )
+
+    def on_ascii_render() -> None:
+        if is_running["value"]:
+            return
+
+        try:
+            args = build_gui_args(collect_values())
+        except ValueError as exc:
+            messagebox.showerror("Paramètres invalides", f"Valeur invalide : {exc}")
+            return
+
+        if not args.input or not args.input.strip():
+            messagebox.showerror("Paramètres invalides", "Veuillez choisir une image d'entrée.")
+            return
+        if not args.ascii_output:
+            messagebox.showerror("Paramètres invalides", "Veuillez choisir un fichier de sortie ASCII.")
+            return
+
+        rename_messages = prepare_outputs_for_active_mode(args)
+
+        try:
+            estimated_seconds, profile = estimate_ascii_for_args(args)
+        except EmojiMakerError as exc:
+            messagebox.showerror("Paramètres invalides", str(exc))
+            return
+        except Exception as exc:
+            messagebox.showerror("Paramètres invalides", f"Impossible d'estimer l'ASCII : {exc}")
+            return
+
+        set_busy_state(
+            "Rendu ASCII en cours... "
+            f"Estimation {format_duration(estimated_seconds)} pour {int(profile['total_cells'])} cellules.",
+            "Analyse des cellules ASCII",
+        )
+        if rename_messages:
+            progress_detail_var.set(" | ".join(rename_messages))
+
+        def worker() -> None:
+            try:
+                output_path = run_ascii_with_args(args)
+            except EmojiMakerError as exc:
+                root.after(0, lambda exc=exc: on_error(str(exc)))
+                return
+            except Exception as exc:  # pragma: no cover
+                root.after(0, lambda exc=exc: on_error(str(exc)))
+                return
+            root.after(0, lambda: on_ascii_success(output_path))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_ascii_success(output_path: Path) -> None:
+        is_running["value"] = False
+        set_controls_state("!disabled")
+        progress_var.set(100.0)
+        progress_detail_var.set("ASCII exporté avec succès.")
+        status_var.set(f"ASCII terminé : {output_path}")
+        refresh_estimate()
+        refresh_recent_gallery()
+        extra_text = f"\nTexte ASCII : {field_vars['ascii_text_output'].get()}" if field_vars["ascii_text_output"].get().strip() else ""
+        messagebox.showinfo(
+            "Succès ASCII",
+            f"ASCII généré :\n{output_path}{extra_text}",
         )
 
     def on_video_render() -> None:
@@ -2489,6 +3325,8 @@ def launch_gui() -> None:
         if args.video_max_columns is None:
             args.video_max_columns = args.columns if args.columns is not None else 500
 
+        rename_messages = prepare_outputs_for_active_mode(args)
+
         try:
             estimated_seconds, frame_count = estimate_video_for_args(args)
         except EmojiMakerError as exc:
@@ -2498,12 +3336,13 @@ def launch_gui() -> None:
             messagebox.showerror("Paramètres invalides", f"Impossible d'estimer la vidéo : {exc}")
             return
 
-        is_running["value"] = True
-        set_controls_state("disabled")
-        status_var.set(
+        set_busy_state(
             "Vidéo en cours... "
-            f"Estimation {format_duration(estimated_seconds)} pour {frame_count} frame(s) à {args.video_fps} FPS."
+            f"Estimation {format_duration(estimated_seconds)} pour {frame_count} frame(s) à {args.video_fps} FPS.",
+            "Préparation des frames",
         )
+        if rename_messages:
+            progress_detail_var.set(" | ".join(rename_messages))
 
         def worker() -> None:
             try:
@@ -2529,11 +3368,14 @@ def launch_gui() -> None:
     def on_video_success(result: VideoResult) -> None:
         is_running["value"] = False
         set_controls_state("!disabled")
+        progress_var.set(100.0)
+        progress_detail_var.set("Vidéo exportée avec succès.")
         status_var.set(
             f"Vidéo terminée : {result.output_path} | "
             f"{result.frame_count} frame(s) en {format_duration(result.duration_seconds)}."
         )
         refresh_estimate()
+        refresh_recent_gallery()
         messagebox.showinfo(
             "Succès vidéo",
             "Animation générée :\n"
@@ -2562,6 +3404,8 @@ def launch_gui() -> None:
             messagebox.showerror("Paramètres invalides", "Veuillez choisir une vidéo de sortie.")
             return
 
+        rename_messages = prepare_outputs_for_active_mode(args)
+
         try:
             estimated_seconds, frame_count, profile = estimate_video_to_video_for_args(args, args.video_to_video_input)
         except EmojiMakerError as exc:
@@ -2571,13 +3415,14 @@ def launch_gui() -> None:
             messagebox.showerror("Paramètres invalides", f"Impossible d'estimer la conversion vidéo -> vidéo : {exc}")
             return
 
-        is_running["value"] = True
-        set_controls_state("disabled")
-        status_var.set(
+        set_busy_state(
             "Conversion vidéo -> vidéo en cours... "
             f"Estimation {format_duration(estimated_seconds)} pour {frame_count} frame(s), "
-            f"grille {int(profile['columns'])}x{int(profile['rows'])}."
+            f"grille {int(profile['columns'])}x{int(profile['rows'])}.",
+            "Analyse de la vidéo source",
         )
+        if rename_messages:
+            progress_detail_var.set(" | ".join(rename_messages))
 
         def worker() -> None:
             try:
@@ -2600,11 +3445,14 @@ def launch_gui() -> None:
     def on_video_to_video_success(result: VideoToVideoResult) -> None:
         is_running["value"] = False
         set_controls_state("!disabled")
+        progress_var.set(100.0)
+        progress_detail_var.set("Vidéo emoji exportée avec succès.")
         status_var.set(
             f"Vidéo -> vidéo terminée : {result.output_path} | "
             f"{result.frame_count} frame(s) en {format_duration(result.duration_seconds)}."
         )
         refresh_estimate()
+        refresh_recent_gallery()
         messagebox.showinfo(
             "Succès vidéo -> vidéo",
             "Vidéo générée :\n"
@@ -2616,15 +3464,33 @@ def launch_gui() -> None:
             f"Taille vidéo : {result.canvas_width}x{result.canvas_height}",
         )
 
+    def run_active_mode() -> None:
+        active_mode = get_active_mode()
+        if active_mode == "image_to_image":
+            on_render()
+        elif active_mode == "image_to_ascii":
+            on_ascii_render()
+        elif active_mode == "image_to_video":
+            on_video_render()
+        else:
+            on_video_to_video_render()
+
+    home_button.configure(command=go_home)
+    generate_button.configure(command=run_active_mode)
+
     restore_gui_settings()
+    refresh_recent_gallery()
 
     for key, variable in field_vars.items():
         variable.trace_add("write", refresh_estimate)
-        if key not in {"input", "output", "video_output", "video_to_video_input", "video_to_video_output", "font"}:
+        if key not in {"input", "output", "ascii_output", "ascii_text_output", "ascii_font", "video_output", "video_to_video_input", "video_to_video_output", "font"}:
             variable.trace_add("write", save_current_gui_settings)
     stretch_var.trace_add("write", refresh_estimate)
     stretch_var.trace_add("write", save_current_gui_settings)
-    notebook.bind("<<NotebookTabChanged>>", refresh_estimate)
+    ascii_color_var.trace_add("write", refresh_estimate)
+    ascii_color_var.trace_add("write", save_current_gui_settings)
+    ascii_invert_var.trace_add("write", refresh_estimate)
+    ascii_invert_var.trace_add("write", save_current_gui_settings)
     refresh_estimate()
 
     def on_close() -> None:

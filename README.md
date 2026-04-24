@@ -1,21 +1,33 @@
 # imgEMOJI
 
-Script Python pour convertir une image en mosaïque d'emojis et produire un PNG en sortie.
+Application Python pour convertir des images et vidéos en rendus emoji ou ASCII.
 
 Le fichier principal est [emoji_maker.py](/var/home/lbazin/PycharmProject/imgEMOJI/emoji_maker.py:1).
 
 Le projet est maintenant rangé dans le package [imgemoji_app](/var/home/lbazin/PycharmProject/imgEMOJI/imgemoji_app/__init__.py:1), avec :
 
 - [imgemoji_app/gui.py](/var/home/lbazin/PycharmProject/imgEMOJI/imgemoji_app/gui.py:1) pour l'interface et l'orchestration ;
+- [imgemoji_app/ascii_art.py](/var/home/lbazin/PycharmProject/imgEMOJI/imgemoji_app/ascii_art.py:1) pour la conversion image -> ASCII ;
 - [imgemoji_app/palette.py](/var/home/lbazin/PycharmProject/imgEMOJI/imgemoji_app/palette.py:1) pour la palette, les polices emoji et Twemoji ;
 - [imgemoji_app/rendering.py](/var/home/lbazin/PycharmProject/imgEMOJI/imgemoji_app/rendering.py:1) pour la grille et le rendu image ;
 - [imgemoji_app/estimation.py](/var/home/lbazin/PycharmProject/imgEMOJI/imgemoji_app/estimation.py:1) pour les estimations ;
 - [imgemoji_app/constants.py](/var/home/lbazin/PycharmProject/imgEMOJI/imgemoji_app/constants.py:1), [common.py](/var/home/lbazin/PycharmProject/imgEMOJI/imgemoji_app/common.py:1), [cache.py](/var/home/lbazin/PycharmProject/imgEMOJI/imgemoji_app/cache.py:1), [models.py](/var/home/lbazin/PycharmProject/imgEMOJI/imgemoji_app/models.py:1) et [errors.py](/var/home/lbazin/PycharmProject/imgEMOJI/imgemoji_app/errors.py:1) pour le socle partagé.
 
-Le script fonctionne maintenant de deux façons :
+Le projet fonctionne maintenant de deux façons :
 
 - sans argument : ouverture d'une interface graphique ;
 - avec des arguments `--...` : exécution en ligne de commande.
+
+## Sorties
+
+L'application centralise les rendus dans le dossier `result/` :
+
+- `result/IMGemoji` pour `Image -> Image`
+- `result/ASCII` pour `Image -> ASCII`
+- `result/IMGvideo` pour `Image -> Vidéo`
+- `result/VIDEOemoji` pour `Vidéo -> Vidéo`
+
+L'interface affiche ses aperçus récents à partir de ce dossier `result/`, et les chemins de sortie par défaut pointent automatiquement vers le bon sous-dossier.
 
 ## Prérequis
 
@@ -33,7 +45,7 @@ sudo dnf install python3-tkinter
 Si vous utilisez le venv du projet :
 
 ```bash
-.venv/bin/python3 emoji_maker.py --input images/pcgb20_0589_fine.png --output result.png --columns 80
+.venv/bin/python3 emoji_maker.py --input images/pcgb20_0589_fine.png --output result/IMGemoji/result.png --columns 80
 ```
 
 ## Fonctionnement
@@ -57,7 +69,7 @@ Le script maintient aussi un historique local des rendus dans `.emoji_cache/rend
 ```bash
 .venv/bin/python3 emoji_maker.py \
   --input images/pcgb20_0589_fine.png \
-  --output result.png \
+  --output result/IMGemoji/result.png \
   --columns 80
 ```
 
@@ -69,34 +81,34 @@ Lancez simplement :
 .venv/bin/python3 emoji_maker.py
 ```
 
-Si `tkinter` est disponible, une fenêtre s'ouvre pour choisir :
+L'interface actuelle fonctionne comme ceci :
 
-- le fichier d'entrée ;
-- le fichier de sortie ;
-- le nombre de colonnes et lignes ;
-- la taille des emojis ;
-- la palette ;
-- le fond ;
-- la police ;
-- la source des emojis ;
-- le seuil alpha ;
-- l'option d'étirement.
-- les paramètres de vidéo progressive.
+- écran d'accueil avec galerie des rendus récents ;
+- bouton `+ Générer` pour choisir le type de rendu ;
+- écran d'édition avec :
+  - un bandeau de navigation (`Accueil`, `+ Générer`) ;
+  - un bloc `Configuration` qui combine les réglages utiles au mode actif ;
+  - un bloc `Générer` avec estimation et barre de progression.
 
-L'interface est maintenant découpée proprement :
+Les champs inutiles sont masqués selon le mode. Par exemple, `Image -> ASCII` n'affiche pas les réglages liés à la palette emoji, à Twemoji ou aux emojis bannis.
 
-- une zone de paramètres communs ;
-- un onglet `Image -> Image` ;
-- un onglet `Image -> Vidéo` ;
-- un onglet `Vidéo -> Vidéo` laissé vide pour les prochains champs / futures fonctionnalités.
+## Module ASCII
 
-Elle affiche aussi :
+Le projet contient aussi un module séparé `image -> ASCII`, lancé avec :
 
-- une estimation du temps de rendu selon l'onglet actif ;
-- le nombre de cases/emojis à traiter pour le rendu image ;
-- une estimation qui devient plus fiable après plusieurs rendus.
+```bash
+.venv/bin/python3 ascii_maker.py \
+  --input images/input/ton_image.png \
+  --output result/ASCII/ascii.png \
+  --columns 120 \
+  --color
+```
 
-L'onglet `Image -> Vidéo` permet de générer une animation où l'image devient progressivement moins pixelisée en augmentant le nombre de cases emoji.
+Sorties supportées :
+
+- `.txt` pour un rendu texte brut ;
+- `.png` pour un rendu image avec police monospace ;
+- `--text-output fichier.txt` si vous voulez garder aussi la version texte en plus du PNG.
 
 Si `tkinter` n'est pas installé, le script affiche un message d'erreur explicite et vous pouvez continuer à utiliser le mode CLI.
 
@@ -121,7 +133,7 @@ Chemin du PNG généré.
 Exemple :
 
 ```bash
---output result.png
+--output result/IMGemoji/result.png
 ```
 
 Obligatoire.
